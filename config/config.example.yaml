@@ -20,7 +20,7 @@ trading:
 strategies:
   momentum_macro:
     enabled: true
-    weight: 0.60
+    weight: 1.00            # 100% do capital — única estratégia ativa
     timeframe: "D1"
     ema_fast: 9
     ema_mid: 21
@@ -31,17 +31,6 @@ strategies:
       - "EQTL3"
       - "ENEV3"
       - "CPLE3"
-
-  pair_trading:
-    enabled: true
-    weight: 0.40
-    timeframe: "D1"
-    lookback_days: 60        # Janela para cálculo do z-score
-    z_entry: 2.0             # Z-score para abertura
-    z_exit: 0.0              # Z-score para fechamento
-    pairs:
-      - ["EQTL3", "TAEE11"]  # Distribuidora vs Transmissora
-      - ["SBSP3", "ENEV3"]   # Saneamento vs Termoelétrica
 
   rebalance_anticipation:
     enabled: true

@@ -22,7 +22,6 @@ from src.risk.risk_manager import RiskManager
 from src.execution.order_executor import OrderExecutor
 from src.strategies import (
     MomentumMacroStrategy,
-    PairTradingStrategy,
     RebalanceAnticipationStrategy,
 )
 
@@ -82,12 +81,6 @@ class TradebotUTIL:
                 di1_threshold=s_cfg["momentum_macro"]["di1_threshold"],
                 assets=s_cfg["momentum_macro"]["assets"],
             ),
-            "pair_trading": PairTradingStrategy(
-                lookback_days=s_cfg["pair_trading"]["lookback_days"],
-                z_entry=s_cfg["pair_trading"]["z_entry"],
-                z_exit=s_cfg["pair_trading"]["z_exit"],
-                pairs=[tuple(p) for p in s_cfg["pair_trading"]["pairs"]],
-            ),
             "rebalance_anticipation": RebalanceAnticipationStrategy(
                 days_before=s_cfg["rebalance_anticipation"]["days_before_rebalance"],
             ),
@@ -101,7 +94,6 @@ class TradebotUTIL:
         # Pesos das estratégias para alocação de capital
         self.strategy_weights = {
             "momentum_macro": s_cfg["momentum_macro"]["weight"],
-            "pair_trading": s_cfg["pair_trading"]["weight"],
             "rebalance_anticipation": s_cfg["rebalance_anticipation"]["weight"],
         }
 
@@ -186,31 +178,20 @@ class TradebotUTIL:
             logger.info("Macro atualizado | Selic={:.2f}% | Regime={}", selic * 100, regime)
 
     def _run_daily_cycle(self) -> None:
-        """Ciclo diário: momentum, pair trading, rebalanceamento."""
+        """Ciclo diário: Momentum Macro + antecipação de rebalanceamento."""
         if not self.risk.is_trading_allowed():
             return
 
         logger.info("── Ciclo diário iniciado ──")
         ohlcv = self._load_ohlcv_all(timeframe="D1", n_bars=300)
 
-        # Momentum Macro
+        # Momentum Macro — única estratégia ativa (100% do capital)
         if self.cfg["strategies"]["momentum_macro"]["enabled"]:
             for ticker in self.strategies["momentum_macro"].assets:
                 if ticker in ohlcv:
                     signal = self.strategies["momentum_macro"].analyze(ticker, ohlcv[ticker])
                     if signal:
                         self._process_signal(signal, "momentum_macro")
-
-        # Pair Trading
-        if self.cfg["strategies"]["pair_trading"]["enabled"]:
-            pair_signals = self.strategies["pair_trading"].run_all_pairs(ohlcv)
-            for ps in pair_signals:
-                if ps.direction == "open":
-                    self._process_signal(ps.long_signal, "pair_trading")
-                    self._process_signal(ps.short_signal, "pair_trading")
-                elif ps.direction == "close":
-                    self.executor.close_position(ps.long_ticker, ohlcv.get(ps.long_ticker, {}).get("close", 0))
-                    self.executor.close_position(ps.short_ticker, ohlcv.get(ps.short_ticker, {}).get("close", 0))
 
         # Antecipação de Rebalanceamento
         if self.cfg["strategies"]["rebalance_anticipation"]["enabled"]:

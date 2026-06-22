@@ -178,9 +178,9 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=["momentum_macro", "pair_trading", "all"],
+        choices=["momentum_macro", "all"],
         default="all",
-        help="Estratégia a backtestear (padrão: all)",
+        help="Estratégia a backtestear (padrão: momentum_macro)",
     )
     parser.add_argument("--start",   default="2019-01-01", help="Data inicial (YYYY-MM-DD)")
     parser.add_argument("--end",     default="2026-01-01", help="Data final (YYYY-MM-DD)")

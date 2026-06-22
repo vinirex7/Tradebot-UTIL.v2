@@ -489,9 +489,7 @@ class BacktestEngine:
         strategies: lista de nomes ou None para todas.
         """
         available = {
-            "momentum_macro":      lambda: run_momentum_macro(self.data, self.capital * 0.60),
-            "pair_trading":        lambda: run_pair_trading(self.data, self.capital * 0.40),
-
+            "momentum_macro": lambda: run_momentum_macro(self.data, self.capital),
         }
 
         to_run = strategies or list(available.keys())
