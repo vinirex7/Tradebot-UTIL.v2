@@ -4,28 +4,29 @@
 # ============================================================
 
 mt5:
-  login: 123456789          # Número da sua conta XP no MT5
-  password: "SUA_SENHA"     # Senha da conta MT5
-  server: "XP Investimentos-Real"  # Servidor XP (real) ou "XPI-Demo" (demo)
-  timeout: 60000            # Timeout de conexão em ms
+  login: 123456789
+  password: "SUA_SENHA"
+  server: "XP Investimentos-Real"
+  timeout: 60000
 
 trading:
-  mode: "paper"             # "live" | "paper" | "backtest"
-  capital: 100000.0         # Capital inicial em BRL
-  max_position_pct: 0.20    # Exposição máxima por ativo (20%)
-  max_drawdown_pct: 0.10    # Drawdown máximo antes de pausar (10%)
-  stop_loss_pct: 0.025      # Stop loss por operação (2.5%)
-  kelly_fraction: 0.25      # Fração do Kelly Criterion
+  mode: "paper"
+  capital: 100000.0
+  max_position_pct: 0.25
+  max_drawdown_pct: 0.10
+  stop_loss_pct: 0.03
+  kelly_fraction: 0.0
 
 strategies:
   momentum_macro:
     enabled: true
-    weight: 1.00            # 100% do capital — única estratégia ativa
+    weight: 1.00
     timeframe: "D1"
     ema_fast: 9
     ema_mid: 21
     ema_slow: 50
-    di1_threshold: 0.1200   # DI1 1 ano; abaixo disso ativa modo momentum long
+    di1_threshold: 0.1200
+    macro_filter_enabled: false
     assets:
       - "SBSP3"
       - "EQTL3"
@@ -33,24 +34,23 @@ strategies:
       - "CPLE3"
 
   rebalance_anticipation:
-    enabled: true
-    weight: 0.10
-    days_before_rebalance: 5 # Dias úteis antes do rebalanceamento B3
-    # Datas de rebalanceamento quadrimestrais (Jan, Mai, Set)
+    enabled: false
+    weight: 0.00
+    days_before_rebalance: 5
     rebalance_months: [1, 5, 9]
 
 data:
-  price_history_days: 252    # Histórico de preços para indicadores (1 ano)
-  adjusted_prices: true      # Usar preços ajustados por dividendos
-  selic_update_interval: 3600 # Atualizar taxa Selic a cada 1h (segundos)
+  price_history_days: 300
+  adjusted_prices: true
+  selic_update_interval: 3600
 
 notifications:
-  enabled: false             # Notificações por Telegram (opcional)
+  enabled: false
   telegram_token: ""
   telegram_chat_id: ""
 
 logging:
-  level: "INFO"              # DEBUG | INFO | WARNING | ERROR
+  level: "INFO"
   file: "logs/tradebot.log"
   rotation: "1 day"
   retention: "30 days"
