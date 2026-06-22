@@ -1,16 +1,16 @@
 """
-Estratégia 2: Momentum Macro-Driven (Selic/DI)
-────────────────────────────────────────────────
-Racional: O UTIL reage fortemente a expectativas de juros.
-Quando há sinal claro de inflexão da Selic (corte iminente), o índice
-tende a ter momentum forte e sustentado.
+Estratégia: Momentum Macro — alinhada ao backtest atualizado
+────────────────────────────────────────────────────────────
+Versão live/paper equivalente à lógica restaurada em backtest/backtest_engine.py:
 
-Implementação:
-  - Filtro: curva DI curta abaixo de threshold → ativa modo long
-  - Técnica: EMA 9 cruzando acima da EMA 21
-  - Stop: fechamento abaixo da EMA 50
-  - Horizonte: 2 semanas a 3 meses
-  - Ativos: SBSP3, EQTL3, ENEV3, CPLE3
+  - Entrada: EMA9 cruza acima da EMA21
+  - Confirmação: EMA21 acima da EMA50 e MACD bullish
+  - Stop: EMA50 dinâmica, com proteção máxima de 3% abaixo da entrada
+  - Sem take profit fixo: deixa o trade correr enquanto a tendência segue válida
+  - Ativos padrão: SBSP3, EQTL3, ENEV3, CPLE3
+
+O filtro macro pode ser ligado por configuração, mas fica desligado por padrão
+para reproduzir o backtest atualizado.
 """
 from __future__ import annotations
 
@@ -34,34 +34,42 @@ class MomentumMacroStrategy:
         ema_slow: int = 50,
         di1_threshold: float = 0.12,
         stop_loss_pct: float = 0.03,
+        macro_filter_enabled: bool = False,
         assets: Optional[list[str]] = None,
     ):
         self.ema_fast = ema_fast
         self.ema_mid = ema_mid
         self.ema_slow = ema_slow
-        self.di1_threshold = di1_threshold   # DI1 1 ano abaixo = momentum long
+        self.di1_threshold = di1_threshold
         self.stop_loss_pct = stop_loss_pct
+        self.macro_filter_enabled = macro_filter_enabled
         self.assets = assets or ["SBSP3", "EQTL3", "ENEV3", "CPLE3"]
-        self._macro_regime: str = "unknown"  # "high_cut_expect" | "easing" | etc.
-        self._momentum_active: bool = False
+        self._macro_regime: str = "unknown"
+        self._momentum_active: bool = True
 
     def set_macro_regime(self, regime: str) -> None:
         """
         Recebe o regime macroeconômico calculado pelo MacroFeed.
-        Ativa/desativa o modo momentum conforme o regime.
+
+        Por padrão, o filtro macro fica desligado para manter o live/paper
+        alinhado com o backtest atualizado. Se macro_filter_enabled=True,
+        o momentum só opera em high_cut_expect ou easing.
         """
         self._macro_regime = regime
-        self._momentum_active = regime in ("high_cut_expect", "easing")
+        self._momentum_active = (
+            regime in ("high_cut_expect", "easing")
+            if self.macro_filter_enabled
+            else True
+        )
         logger.info(
-            "[Momentum] Regime macroeconômico: {} | Momentum ativo: {}",
-            regime, self._momentum_active
+            "[Momentum] Regime macroeconômico: {} | filtro_macro={} | Momentum ativo: {}",
+            regime, self.macro_filter_enabled, self._momentum_active
         )
 
     def analyze(self, ticker: str, ohlcv: pd.DataFrame) -> Optional[TradeSignal]:
         """
-        Gera sinal de momentum se:
-        1. O regime macro permite (Selic com expectativa de corte), E
-        2. EMA9 cruzou acima de EMA21 (confirmação técnica)
+        Gera sinal de compra quando a lógica do backtest atualizado aparece:
+        EMA9 cruza acima da EMA21, EMA21 está acima da EMA50 e MACD está bullish.
         """
         if ticker not in self.assets:
             return None
@@ -80,63 +88,84 @@ class MomentumMacroStrategy:
         ema50 = ema(close, self.ema_slow)
         macd_line, signal_line, _ = macd(close)
 
-        # EMA cruzamento: EMA9 acima de EMA21 e ambas acima de EMA50
+        if pd.isna(ema9.iloc[-1]) or pd.isna(ema21.iloc[-1]) or pd.isna(ema50.iloc[-1]):
+            return None
+
         cross_up = (
             ema9.iloc[-1] > ema21.iloc[-1]
-            and ema9.iloc[-2] <= ema21.iloc[-2]  # Cruzamento confirmado
-            and ema21.iloc[-1] > ema50.iloc[-1]  # Tendência de alta
+            and ema9.iloc[-2] <= ema21.iloc[-2]
+            and ema21.iloc[-1] > ema50.iloc[-1]
         )
-
-        # Confirmação MACD
         macd_bullish = macd_line.iloc[-1] > signal_line.iloc[-1]
 
         if cross_up and macd_bullish:
-            entry = close.iloc[-1]
-            stop = ema50.iloc[-1]  # Stop na EMA50
-            risk = entry - stop
-            tp = entry + risk * 2  # Risk/Reward 1:2
+            entry = float(close.iloc[-1])
+            ema50_stop = float(ema50.iloc[-1])
+            max_loss_stop = entry * (1 - self.stop_loss_pct)
+
+            # Igual ao backtest: stop inicial pela EMA50, com proteção de perda máxima.
+            stop = max(ema50_stop, max_loss_stop)
 
             logger.info(
-                "[Momentum] LONG {} | EMA9={:.2f} > EMA21={:.2f} | regime={}",
-                ticker, ema9.iloc[-1], ema21.iloc[-1], self._macro_regime
+                "[Momentum] LONG {} | EMA9={:.2f} > EMA21={:.2f} | EMA21>EMA50 | MACD bullish",
+                ticker, ema9.iloc[-1], ema21.iloc[-1]
             )
             return TradeSignal(
                 ticker=ticker,
                 direction="long",
                 strategy=self.name,
                 entry_price=entry,
-                stop_loss_price=max(stop, entry * (1 - self.stop_loss_pct)),
-                take_profit_price=tp,
-                confidence=0.85,
+                stop_loss_price=stop,
+                take_profit_price=0.0,  # Sem take profit fixo, igual ao backtest atualizado.
+                confidence=1.0,
                 notes=(
-                    f"Regime={self._macro_regime} | "
                     f"EMA9={ema9.iloc[-1]:.2f} | EMA21={ema21.iloc[-1]:.2f} | "
-                    f"EMA50={ema50.iloc[-1]:.2f}"
+                    f"EMA50={ema50.iloc[-1]:.2f} | TP=none | macro_filter={self.macro_filter_enabled}"
                 ),
             )
 
         return None
 
-    def check_exit(self, ticker: str, ohlcv: pd.DataFrame, position_dir: str) -> bool:
+    def check_exit(
+        self,
+        ticker: str,
+        ohlcv: pd.DataFrame,
+        position_dir: str,
+        entry_price: Optional[float] = None,
+    ) -> bool:
         """
-        Saída: fechamento abaixo da EMA 50 (invalidação da tendência).
+        Saída alinhada ao backtest atualizado:
+        - Fecha se o preço cair abaixo da EMA50 dinâmica com folga de 1%.
+        - Fecha se cair mais que stop_loss_pct abaixo da entrada.
+        - Não fecha por take profit fixo.
         """
         if position_dir != "long":
+            return False
+
+        min_bars = max(self.ema_slow, 60)
+        if len(ohlcv) < min_bars:
             return False
 
         close = ohlcv["close"]
         ema50 = ema(close, self.ema_slow)
 
-        if close.iloc[-1] < ema50.iloc[-1]:
+        current_close = float(close.iloc[-1])
+        trailing_stop = float(ema50.iloc[-1]) * 0.99
+
+        if current_close < trailing_stop:
             logger.info(
-                "[Momentum] Saída {} | close={:.2f} < EMA50={:.2f}",
-                ticker, close.iloc[-1], ema50.iloc[-1]
+                "[Momentum] Saída {} | close={:.2f} < trailing EMA50={:.2f}",
+                ticker, current_close, trailing_stop
             )
             return True
 
-        # Saída se regime virou
-        if self._macro_regime in ("high_stable", "low_stable"):
-            logger.info("[Momentum] Saída {} | regime voltou a {}", ticker, self._macro_regime)
-            return True
+        if entry_price is not None:
+            hard_stop = float(entry_price) * (1 - self.stop_loss_pct)
+            if current_close < hard_stop:
+                logger.info(
+                    "[Momentum] Saída {} | close={:.2f} < stop máximo={:.2f}",
+                    ticker, current_close, hard_stop
+                )
+                return True
 
         return False
