@@ -254,27 +254,47 @@ def download_benchmark(start: str, end: str) -> pd.Series:
 #           distância mínima da banda 0.5%
 # ─────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────
+# Estratégia 1: Reversão à Média — v3
+#
+# Diagnóstico v2: win rate 27%, -21% retorno.
+# Causa raiz: operações SHORT em setor que sobe estruturalmente.
+#
+# Mudanças v3:
+#  - APENAS LONG (sem short — utilities têm viés de alta secular)
+#  - Filtro de tendência: só entra long se EMA200 está subindo (mercado bull)
+#  - RSI: máximo de 22 (ainda mais extremo)
+#  - Volume acima da média (confirma que a queda tem pressão real)
+#  - Stop dinâmico: maior entre 5% fixo e mínimo dos últimos 5 candles
+#  - Take profit: 2x o risco (risk/reward 1:2)
+# ─────────────────────────────────────────────────────────
+
 def run_mean_reversion(
     data: dict[str, pd.DataFrame],
     capital: float = 100_000.0,
-    stop_pct: float = 0.04,          # v2: stop mais largo (era 2.5%)
+    stop_pct: float = 0.05,          # v3: stop 5% (espaço para respirar)
+    rr_ratio: float = 2.0,           # v3: take profit = 2x o risco
     bb_period: int = 20,
     bb_std: float = 2.0,
     rsi_period: int = 14,
-    rsi_os: float = 25,              # v2: mais extremo (era 30)
-    rsi_ob: float = 75,              # v2: mais extremo (era 70)
-    confirm_candles: int = 2,        # v2: N candles consecutivos além da banda
-    min_bb_dist: float = 0.005,      # v2: preço >= 0.5% além da banda
+    rsi_os: float = 22,              # v3: ainda mais extremo
+    trend_ema: int = 200,            # v3: filtro de tendência macro
+    vol_mult: float = 1.2,           # v3: volume >= 1.2x a média de 20 dias
+    confirm_candles: int = 2,
     assets: Optional[list[str]] = None,
 ) -> list[Trade]:
     """
-    Backtest de Reversão à Média (Bollinger + RSI) — v2.
+    Backtest de Reversão à Média — v3 (apenas LONG).
 
-    Melhorias vs v1:
-    - RSI threshold mais extremo (25/75) → menos sinais, maior qualidade
-    - Stop loss mais largo (4%) → utilities precisam de espaço para respirar
-    - Confirmação de 2 candles consecutivos → filtra falsos rompimentos
-    - Distância mínima da banda → garante oversold/overbought real
+    Lógica central:
+    1. Tendência macro de alta (preço acima da EMA200 em ascensão)
+    2. Preço abaixo da Banda de Bollinger inferior por 2+ candles
+    3. RSI < 22 (oversold extremo)
+    4. Volume acima da média (confirma que a queda é real, não gap)
+    5. Entrada no próximo candle de abertura (sem chasing)
+    6. Stop: máximo entre 5% fixo e mínimo dos últimos 5 candles
+    7. Take profit: 2x o risco a partir da entrada
     """
     assets = assets or ["SBSP3", "EQTL3", "CPLE3", "EGIE3", "TAEE11"]
     trades = []
@@ -284,83 +304,88 @@ def run_mean_reversion(
         if ticker not in data:
             continue
 
-        ohlcv = data[ticker]
-        close = ohlcv["close"]
+        ohlcv   = data[ticker]
+        close   = ohlcv["close"]
+        volume  = ohlcv.get("volume", pd.Series(index=ohlcv.index))
+
         upper, mid, lower = bollinger_bands(close, bb_period, bb_std)
-        rsi_s = rsi(close, rsi_period)
+        rsi_s   = rsi(close, rsi_period)
+        ema200  = ema(close, trend_ema)
+        vol_ma  = volume.rolling(20).mean() if not volume.empty else None
 
         position: Optional[dict] = None
         long_count = 0
-        short_count = 0
+        min_i = trend_ema + bb_period + rsi_period + confirm_candles + 5
 
-        start_i = bb_period + rsi_period + confirm_candles + 2
-        for i in range(start_i, len(ohlcv)):
-            c = close.iloc[i]
-            u = upper.iloc[i]
+        for i in range(min_i, len(ohlcv)):
+            c  = close.iloc[i]
             lo = lower.iloc[i]
-            m = mid.iloc[i]
-            r = rsi_s.iloc[i]
+            m  = mid.iloc[i]
+            r  = rsi_s.iloc[i]
+            e2 = ema200.iloc[i]
             dt = ohlcv.index[i]
 
-            if pd.isna(u) or pd.isna(lo) or pd.isna(r):
+            if pd.isna(lo) or pd.isna(r) or pd.isna(e2):
                 continue
 
+            # Filtro 1: tendência macro de alta (EMA200 subindo)
+            ema200_rising = e2 > ema200.iloc[i - 5]
+            above_ema200  = c > e2 * 0.95   # tolerância de 5% abaixo da EMA200
+
+            # Filtro 2: volume
+            vol_ok = True
+            if vol_ma is not None and not pd.isna(vol_ma.iloc[i]) and vol_ma.iloc[i] > 0:
+                vol_ok = volume.iloc[i] >= vol_ma.iloc[i] * vol_mult
+
             if position is None:
-                below_band = c < lo and r < rsi_os
-                above_band = c > u and r > rsi_ob
+                # Contar candles consecutivos abaixo da banda com RSI oversold
+                if c < lo and r < rsi_os:
+                    long_count += 1
+                else:
+                    long_count = 0
 
-                long_count  = long_count  + 1 if below_band else 0
-                short_count = short_count + 1 if above_band else 0
+                # Sinal: confirmação + filtros
+                if (long_count >= confirm_candles
+                        and vol_ok
+                        and ema200_rising
+                        and above_ema200):
 
-                # Sinal LONG: N candles confirmados + distância mínima
-                if long_count >= confirm_candles and (lo - c) / lo >= min_bb_dist:
                     shares = int(alloc_per_asset / c)
                     if shares > 0:
+                        # Stop dinâmico: maior entre percentual fixo e mínimo recente
+                        recent_low = ohlcv["low"].iloc[max(0, i-5):i].min() if "low" in ohlcv.columns else c * (1 - stop_pct)
+                        stop_price = min(c * (1 - stop_pct), recent_low * 0.995)
+                        risk       = c - stop_price
+                        tp_price   = c + risk * rr_ratio  # 1:2 risk/reward
+
                         position = {
-                            "direction": "long",
-                            "entry_date": dt,
+                            "direction":   "long",
+                            "entry_date":  dt,
                             "entry_price": c,
-                            "stop": c * (1 - stop_pct),
-                            "target": m,
-                            "shares": shares,
+                            "stop":        stop_price,
+                            "target":      tp_price,
+                            "shares":      shares,
                         }
                         long_count = 0
-
-                # Sinal SHORT: N candles confirmados + distância mínima
-                elif short_count >= confirm_candles and (c - u) / u >= min_bb_dist:
-                    shares = int(alloc_per_asset / c)
-                    if shares > 0:
-                        position = {
-                            "direction": "short",
-                            "entry_date": dt,
-                            "entry_price": c,
-                            "stop": c * (1 + stop_pct),
-                            "target": m,
-                            "shares": shares,
-                        }
-                        short_count = 0
             else:
-                exit_price = None
+                exit_price  = None
                 exit_reason = ""
 
-                if position["direction"] == "long":
-                    if c <= position["stop"]:
-                        exit_price, exit_reason = c, "stop_loss"
-                    elif c >= position["target"]:
-                        exit_price, exit_reason = c, "take_profit"
-                else:
-                    if c >= position["stop"]:
-                        exit_price, exit_reason = c, "stop_loss"
-                    elif c <= position["target"]:
-                        exit_price, exit_reason = c, "take_profit"
+                if c <= position["stop"]:
+                    exit_price, exit_reason = c, "stop_loss"
+                elif c >= position["target"]:
+                    exit_price, exit_reason = c, "take_profit"
+                # Saída de tempo: posição aberta há mais de 30 dias sem atingir alvo
+                elif (dt - position["entry_date"]).days > 30:
+                    exit_price, exit_reason = c, "timeout"
 
                 if exit_price:
-                    ep = position["entry_price"]
-                    sh = position["shares"]
-                    ret = (exit_price - ep) / ep if position["direction"] == "long" else (ep - exit_price) / ep
+                    ep  = position["entry_price"]
+                    sh  = position["shares"]
+                    ret = (exit_price - ep) / ep
                     trades.append(Trade(
                         ticker=ticker, strategy="mean_reversion",
-                        direction=position["direction"],
+                        direction="long",
                         entry_date=position["entry_date"], exit_date=dt,
                         entry_price=ep, exit_price=exit_price,
                         shares=sh, capital_used=ep * sh,
@@ -370,13 +395,13 @@ def run_mean_reversion(
                     position = None
 
         if position:
-            c = close.iloc[-1]
-            ep = position["entry_price"]
-            sh = position["shares"]
-            ret = (c - ep) / ep if position["direction"] == "long" else (ep - c) / ep
+            c   = close.iloc[-1]
+            ep  = position["entry_price"]
+            sh  = position["shares"]
+            ret = (c - ep) / ep
             trades.append(Trade(
                 ticker=ticker, strategy="mean_reversion",
-                direction=position["direction"],
+                direction="long",
                 entry_date=position["entry_date"], exit_date=ohlcv.index[-1],
                 entry_price=ep, exit_price=c,
                 shares=sh, capital_used=ep * sh,
@@ -388,9 +413,11 @@ def run_mean_reversion(
 
 
 # ─────────────────────────────────────────────────────────
-# Estratégia 2: Momentum Macro — v2
-# Mudanças: trailing stop na EMA21 (antes EMA50 fixo),
-#           take profit parcial em +15%, confirmação MACD hist > 0
+# Estratégia 2: Momentum Macro — v1 restaurado
+#
+# A v2 com trailing stop + TP 15% cortou cedo demais (+114% vs +277%).
+# Restaurando a lógica original da v1: stop na EMA50 da entrada,
+# sem take profit fixo (deixa o trade correr enquanto tendência válida).
 # ─────────────────────────────────────────────────────────
 
 def run_momentum_macro(
@@ -399,33 +426,30 @@ def run_momentum_macro(
     ema_fast: int = 9,
     ema_mid: int = 21,
     ema_slow: int = 50,
-    stop_pct: float = 0.03,
-    trailing_ema: int = 21,          # v2: trailing stop na EMA21
-    tp_pct: float = 0.15,            # v2: take profit em +15%
+    stop_pct: float = 0.03,          # Stop máximo 3% abaixo da entrada
     assets: Optional[list[str]] = None,
 ) -> list[Trade]:
     """
-    Backtest de Momentum Macro — v2.
+    Backtest de Momentum Macro — v1 restaurado.
 
-    Melhorias vs v1:
-    - Trailing stop sobe com a EMA21 (antes parado na EMA50 da entrada)
-    - Take profit em +15% garante captura de ganhos em rallies fortes
-    - Confirmação adicional: histograma MACD > 0 (força crescente)
+    Lógica: EMA9 cruza acima de EMA21, com EMA21 > EMA50 e MACD bullish.
+    Stop: EMA50 dinâmica (sobe junto com o mercado, nunca desce).
+    Sem take profit fixo: deixa o trade correr enquanto a tendência for válida.
     """
     assets = assets or ["SBSP3", "EQTL3", "ENEV3", "CPLE3"]
     trades = []
-    alloc = capital / len(assets)
+    alloc  = capital / len(assets)
 
     for ticker in assets:
         if ticker not in data:
             continue
 
-        ohlcv = data[ticker]
-        close = ohlcv["close"]
-        e9   = ema(close, ema_fast)
-        e21  = ema(close, ema_mid)
-        e50  = ema(close, ema_slow)
-        macd_line, sig_line, hist = macd(close)
+        ohlcv     = data[ticker]
+        close     = ohlcv["close"]
+        e9        = ema(close, ema_fast)
+        e21       = ema(close, ema_mid)
+        e50       = ema(close, ema_slow)
+        macd_line, sig_line, _ = macd(close)
 
         position = None
 
@@ -436,37 +460,33 @@ def run_momentum_macro(
             if pd.isna(e9.iloc[i]) or pd.isna(e50.iloc[i]):
                 continue
 
-            cross_up   = (e9.iloc[i] > e21.iloc[i]
-                          and e9.iloc[i-1] <= e21.iloc[i-1]
-                          and e21.iloc[i] > e50.iloc[i])
-            macd_bull  = macd_line.iloc[i] > sig_line.iloc[i]
-            macd_accel = hist.iloc[i] > 0    # v2: histograma positivo (força crescente)
+            cross_up  = (e9.iloc[i]  > e21.iloc[i]
+                         and e9.iloc[i-1] <= e21.iloc[i-1]
+                         and e21.iloc[i] > e50.iloc[i])
+            macd_bull = macd_line.iloc[i] > sig_line.iloc[i]
 
-            if position is None and cross_up and macd_bull and macd_accel:
+            if position is None and cross_up and macd_bull:
                 shares = int(alloc / c)
                 if shares > 0:
                     position = {
                         "entry_date":  dt,
                         "entry_price": c,
-                        "trailing_stop": e21.iloc[i] * 0.98,  # v2: 2% abaixo da EMA21
-                        "tp_price":    c * (1 + tp_pct),
+                        "stop":        e50.iloc[i],   # stop na EMA50
                         "shares":      shares,
                     }
 
             elif position is not None:
-                # Atualizar trailing stop: sobe junto com EMA21
-                new_stop = e21.iloc[i] * 0.98
-                position["trailing_stop"] = max(position["trailing_stop"], new_stop)
+                # Stop sobe com a EMA50, nunca desce
+                new_stop = max(position["stop"], e50.iloc[i] * 0.99)
+                position["stop"] = new_stop
 
                 exit_price  = None
                 exit_reason = ""
 
-                if c <= position["trailing_stop"]:
+                if c < position["stop"]:
                     exit_price, exit_reason = c, "trailing_stop"
                 elif c < position["entry_price"] * (1 - stop_pct):
                     exit_price, exit_reason = c, "stop_loss"
-                elif c >= position["tp_price"]:
-                    exit_price, exit_reason = c, "take_profit"
 
                 if exit_price:
                     ep  = position["entry_price"]
@@ -484,9 +504,9 @@ def run_momentum_macro(
                     position = None
 
         if position:
-            c  = close.iloc[-1]
-            ep = position["entry_price"]
-            sh = position["shares"]
+            c   = close.iloc[-1]
+            ep  = position["entry_price"]
+            sh  = position["shares"]
             ret = (c - ep) / ep
             trades.append(Trade(
                 ticker=ticker, strategy="momentum_macro",
@@ -499,13 +519,6 @@ def run_momentum_macro(
             ))
 
     return trades
-
-
-# ─────────────────────────────────────────────────────────
-# Estratégia 3: Pair Trading — v2
-# Mudanças: z_entry 2.5 (era 2.0), stop 6% (era 4%),
-#           cooldown de 5 dias após stop, lookback 90 dias
-# ─────────────────────────────────────────────────────────
 
 def run_pair_trading(
     data: dict[str, pd.DataFrame],
@@ -617,83 +630,6 @@ def run_pair_trading(
 # Mudanças: threshold de queda 2.5% (era 0.8%), máx 1 op/ativo/trimestre,
 #           janela mínima de 20 dias entre operações no mesmo ativo
 # ─────────────────────────────────────────────────────────
-
-def run_dividend_capture(
-    data: dict[str, pd.DataFrame],
-    capital: float = 100_000.0,
-    days_before: int = 4,
-    stop_pct: float = 0.025,
-    min_drop_pct: float = 0.025,     # v2: queda mínima 2.5% no ex-date (era 0.8%)
-    min_days_between: int = 45,      # v2: mínimo 45 dias entre operações no mesmo ativo
-    assets: Optional[list[str]] = None,
-) -> list[Trade]:
-    """
-    Backtest de Captura de Dividendos — v2.
-
-    Melhorias vs v1:
-    - Threshold de detecção 2.5%: só quedas que claramente representam
-      ex-dates de dividendos relevantes (elimina 95% dos falsos positivos)
-    - Cooldown de 45 dias: evita múltiplas operações no mesmo ciclo mensal
-    - Resultado: de 1705 operações falsas → ~30-60 operações reais por período
-    """
-    assets = assets or ["TAEE11", "EGIE3", "CPFE3", "ENGI11"]
-    trades = []
-    alloc = capital / len(assets)
-
-    for ticker in assets:
-        if ticker not in data:
-            continue
-
-        ohlcv = data[ticker]
-        close = ohlcv["close"]
-        daily_ret = close.pct_change()
-
-        # Detectar ex-dates: quedas abruptas >= min_drop_pct
-        ex_dates_idx = daily_ret[daily_ret <= -min_drop_pct].index.tolist()
-
-        last_trade_idx = -min_days_between  # rastrear última operação
-
-        for ex_dt in ex_dates_idx:
-            idx = ohlcv.index.get_loc(ex_dt)
-            if idx < days_before + 2:
-                continue
-
-            # Cooldown: mínimo de dias entre operações no mesmo ativo
-            if (idx - last_trade_idx) < min_days_between:
-                continue
-
-            entry_idx   = idx - days_before
-            entry_price = close.iloc[entry_idx]
-            entry_date  = ohlcv.index[entry_idx]
-            shares      = int(alloc / entry_price)
-
-            if shares == 0:
-                continue
-
-            exit_idx   = min(idx + 1, len(ohlcv) - 1)
-            exit_price = close.iloc[exit_idx]
-            exit_date  = ohlcv.index[exit_idx]
-
-            ret = (exit_price - entry_price) / entry_price
-            pnl = ret * entry_price * shares
-
-            trades.append(Trade(
-                ticker=ticker, strategy="dividend_capture",
-                direction="long",
-                entry_date=entry_date, exit_date=exit_date,
-                entry_price=entry_price, exit_price=exit_price,
-                shares=shares, capital_used=entry_price * shares,
-                pnl=pnl, return_pct=ret * 100,
-                exit_reason="ex_date",
-            ))
-            last_trade_idx = idx
-
-    return trades
-
-# ─────────────────────────────────────────────────────────
-# Motor principal
-# ─────────────────────────────────────────────────────────
-
 class BacktestEngine:
     """Orquestra o backtest de todas as estratégias."""
 
@@ -722,9 +658,9 @@ class BacktestEngine:
         """
         available = {
             "mean_reversion":      lambda: run_mean_reversion(self.data, self.capital * 0.35),
-            "momentum_macro":      lambda: run_momentum_macro(self.data, self.capital * 0.30),
-            "pair_trading":        lambda: run_pair_trading(self.data, self.capital * 0.15),
-            "dividend_capture":    lambda: run_dividend_capture(self.data, self.capital * 0.10),
+            "momentum_macro":      lambda: run_momentum_macro(self.data, self.capital * 0.40),
+            "pair_trading":        lambda: run_pair_trading(self.data, self.capital * 0.25),
+
         }
 
         to_run = strategies or list(available.keys())
