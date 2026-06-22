@@ -18,14 +18,11 @@ from loguru import logger
 from src.utils.logger import setup_logger
 from src.data.mt5_feed import MT5Feed
 from src.data.macro_feed import MacroFeed
-from src.data.dividend_calendar import DividendCalendar
 from src.risk.risk_manager import RiskManager
 from src.execution.order_executor import OrderExecutor
 from src.strategies import (
-    MeanReversionStrategy,
     MomentumMacroStrategy,
     PairTradingStrategy,
-    DividendCaptureStrategy,
     RebalanceAnticipationStrategy,
 )
 
@@ -60,7 +57,6 @@ class TradebotUTIL:
             timeout=mt5_cfg.get("timeout", 60000),
         )
         self.macro = MacroFeed()
-        self.div_calendar = DividendCalendar()
 
         # Risk Manager
         t_cfg = config["trading"]
@@ -79,16 +75,6 @@ class TradebotUTIL:
         # Estratégias
         s_cfg = config["strategies"]
         self.strategies = {
-            "mean_reversion": MeanReversionStrategy(
-                bollinger_period=s_cfg["mean_reversion"]["bollinger_period"],
-                bollinger_std=s_cfg["mean_reversion"]["bollinger_std"],
-                rsi_period=s_cfg["mean_reversion"]["rsi_period"],
-                rsi_oversold=s_cfg["mean_reversion"]["rsi_oversold"],
-                rsi_overbought=s_cfg["mean_reversion"]["rsi_overbought"],
-                stop_loss_pct=t_cfg["stop_loss_pct"],
-                take_profit_pct=s_cfg["mean_reversion"]["take_profit_pct"],
-                assets=s_cfg["mean_reversion"]["assets"],
-            ),
             "momentum_macro": MomentumMacroStrategy(
                 ema_fast=s_cfg["momentum_macro"]["ema_fast"],
                 ema_mid=s_cfg["momentum_macro"]["ema_mid"],
@@ -102,13 +88,6 @@ class TradebotUTIL:
                 z_exit=s_cfg["pair_trading"]["z_exit"],
                 pairs=[tuple(p) for p in s_cfg["pair_trading"]["pairs"]],
             ),
-            "dividend_capture": DividendCaptureStrategy(
-                days_before_exdate=s_cfg["dividend_capture"]["days_before_exdate"],
-                min_dy_pct=s_cfg["dividend_capture"]["min_dy_pct"],
-                min_volume_brl=s_cfg["dividend_capture"]["min_volume_brl"],
-                assets=s_cfg["dividend_capture"]["assets"],
-                calendar=self.div_calendar,
-            ),
             "rebalance_anticipation": RebalanceAnticipationStrategy(
                 days_before=s_cfg["rebalance_anticipation"]["days_before_rebalance"],
             ),
@@ -121,10 +100,8 @@ class TradebotUTIL:
 
         # Pesos das estratégias para alocação de capital
         self.strategy_weights = {
-            "mean_reversion": s_cfg["mean_reversion"]["weight"],
             "momentum_macro": s_cfg["momentum_macro"]["weight"],
             "pair_trading": s_cfg["pair_trading"]["weight"],
-            "dividend_capture": s_cfg["dividend_capture"]["weight"],
             "rebalance_anticipation": s_cfg["rebalance_anticipation"]["weight"],
         }
 
@@ -147,7 +124,7 @@ class TradebotUTIL:
         # Atualizar macro na inicialização
         self._update_macro()
 
-        # Agendar tarefas
+        # Agendar tarefas (ciclo intraday removido — mean_reversion excluído)
         self._schedule_jobs()
 
         logger.info("Bot ativo. Pressione Ctrl+C para encerrar.")
@@ -170,17 +147,11 @@ class TradebotUTIL:
 
     def _schedule_jobs(self) -> None:
         """Define horários de execução das rotinas."""
-        # Análise intraday (a cada 1h em dias úteis)
-        schedule.every().hour.do(self._run_intraday_cycle)
-
         # Análise diária (abertura do pregão)
         schedule.every().day.at("10:05").do(self._run_daily_cycle)
 
         # Atualização de dados macro (a cada 4h)
         schedule.every(4).hours.do(self._update_macro)
-
-        # Scan de dividendos (diário)
-        schedule.every().day.at("08:30").do(self._scan_dividends)
 
         # Relatório de portfólio (fim do dia)
         schedule.every().day.at("17:15").do(self._print_summary)
@@ -246,37 +217,6 @@ class TradebotUTIL:
             reb_signals = self.strategies["rebalance_anticipation"].scan(ohlcv)
             for signal in reb_signals:
                 self._process_signal(signal, "rebalance_anticipation")
-
-    def _run_intraday_cycle(self) -> None:
-        """Ciclo intraday: reversão à média (H1)."""
-        if not self.risk.is_trading_allowed():
-            return
-
-        if not self.cfg["strategies"]["mean_reversion"]["enabled"]:
-            return
-
-        logger.debug("── Ciclo intraday (H1) iniciado ──")
-        mr_assets = self.strategies["mean_reversion"].assets
-        ohlcv = {}
-        for ticker in mr_assets:
-            df = self.mt5.get_ohlcv(ticker, timeframe="H1", n_bars=100)
-            if df is not None:
-                ohlcv[ticker] = df
-
-        for ticker, df in ohlcv.items():
-            signal = self.strategies["mean_reversion"].analyze(ticker, df)
-            if signal:
-                self._process_signal(signal, "mean_reversion")
-
-    def _scan_dividends(self) -> None:
-        """Scan diário de oportunidades de captura de dividendos."""
-        if not self.cfg["strategies"]["dividend_capture"]["enabled"]:
-            return
-
-        ohlcv = self._load_ohlcv_all("D1", n_bars=30)
-        signals = self.strategies["dividend_capture"].scan(ohlcv)
-        for signal in signals:
-            self._process_signal(signal, "dividend_capture")
 
     # ──────────────────────────────────────────────
     # Processamento de sinais

@@ -6,7 +6,7 @@ Script principal para rodar o backtest completo via yfinance.
 
 Uso:
     python backtest/run_backtest.py
-    python backtest/run_backtest.py --strategy mean_reversion
+    python backtest/run_backtest.py --strategy momentum_macro
     python backtest/run_backtest.py --start 2022-01-01 --end 2026-01-01
     python backtest/run_backtest.py --capital 50000
     python backtest/run_backtest.py --plot
@@ -178,7 +178,7 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=["mean_reversion", "momentum_macro", "pair_trading", "dividend_capture", "all"],
+        choices=["momentum_macro", "pair_trading", "all"],
         default="all",
         help="Estratégia a backtestear (padrão: all)",
     )

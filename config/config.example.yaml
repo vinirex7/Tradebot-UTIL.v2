@@ -18,26 +18,9 @@ trading:
   kelly_fraction: 0.25      # Fração do Kelly Criterion
 
 strategies:
-  mean_reversion:
-    enabled: true
-    weight: 0.35            # Peso na alocação de capital
-    timeframe: "H1"         # M1, M5, M15, H1, H4, D1
-    bollinger_period: 20
-    bollinger_std: 2.0
-    rsi_period: 14
-    rsi_oversold: 30
-    rsi_overbought: 70
-    take_profit_pct: 0.015  # Take profit = 1.5% (retorno à média)
-    assets:
-      - "SBSP3"
-      - "EQTL3"
-      - "CPLE3"
-      - "EGIE3"
-      - "TAEE11"
-
   momentum_macro:
     enabled: true
-    weight: 0.30
+    weight: 0.60
     timeframe: "D1"
     ema_fast: 9
     ema_mid: 21
@@ -51,7 +34,7 @@ strategies:
 
   pair_trading:
     enabled: true
-    weight: 0.15
+    weight: 0.40
     timeframe: "D1"
     lookback_days: 60        # Janela para cálculo do z-score
     z_entry: 2.0             # Z-score para abertura
@@ -59,18 +42,6 @@ strategies:
     pairs:
       - ["EQTL3", "TAEE11"]  # Distribuidora vs Transmissora
       - ["SBSP3", "ENEV3"]   # Saneamento vs Termoelétrica
-
-  dividend_capture:
-    enabled: true
-    weight: 0.10
-    days_before_exdate: 4    # Dias úteis antes do ex-date para entrar
-    min_dy_pct: 0.05         # DY mínimo de 5% para operar
-    min_volume_brl: 50000000 # Volume médio mínimo diário (R$50M)
-    assets:
-      - "TAEE11"
-      - "EGIE3"
-      - "CPFE3"
-      - "ENGI11"
 
   rebalance_anticipation:
     enabled: true
