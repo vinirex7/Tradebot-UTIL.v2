@@ -212,6 +212,8 @@ class TradebotUTIL:
             capital=strategy_capital,
             max_pos_pct=self.risk.max_pos_pct,
             stop_loss_pct=self.risk.stop_loss_pct,
+            max_drawdown=self.risk.max_drawdown,
+            kelly_fraction=self.risk.kelly_fraction,
         )
 
         pos_size = effective_risk.calculate_position_size(signal)
