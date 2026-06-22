@@ -6,7 +6,7 @@ scipy==1.13.0
 ta==0.11.0
 requests==2.32.3
 PyYAML==6.0.1
-python-bcb==0.3.1
+python-bcb==0.4.0
 beautifulsoup4==4.12.3
 lxml==5.2.1
 matplotlib==3.9.0
