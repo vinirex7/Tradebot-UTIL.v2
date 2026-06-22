@@ -1,0 +1,165 @@
+# ============================================================
+# Composição do Índice UTIL — Vigência Maio–Agosto 2026
+# Fonte: B3 Plantão de Notícias (pregão 30/03/2026)
+# Redutor: 22.830.334,81
+# Qtde. Teórica Total: 12.713.019.394
+# ============================================================
+
+util_composition:
+  - ticker: "SBSP3"
+    company: "Sabesp"
+    type: "ON NM"
+    theoretical_qty: 560969327
+    weight_pct: 19.999
+    subsector: "saneamento"
+    liquidity_tier: 1   # 1=alta, 2=media, 3=baixa
+
+  - ticker: "AXIA3"
+    company: "Axia Energia"
+    type: "ON N1"
+    theoretical_qty: 1327967084
+    weight_pct: 17.291
+    subsector: "transmissao"
+    liquidity_tier: 1
+
+  - ticker: "EQTL3"
+    company: "Equatorial Energia"
+    type: "ON NM"
+    theoretical_qty: 1247728993
+    weight_pct: 11.431
+    subsector: "distribuicao"
+    liquidity_tier: 1
+
+  - ticker: "ENEV3"
+    company: "Eneva"
+    type: "ON NM"
+    theoretical_qty: 1913352180
+    weight_pct: 10.708
+    subsector: "geracao_termeletrica"
+    liquidity_tier: 1
+
+  - ticker: "CPLE3"
+    company: "Copel"
+    type: "ON NM"
+    theoretical_qty: 2969406694
+    weight_pct: 10.318
+    subsector: "distribuicao_transmissao"
+    liquidity_tier: 1
+
+  - ticker: "CMIG4"
+    company: "Cemig"
+    type: "PN N1"
+    theoretical_qty: 1904057894
+    weight_pct: 5.422
+    subsector: "distribuicao"
+    liquidity_tier: 1
+    note: "Estatal — subponderar conforme análise de risco político"
+
+  - ticker: "ENGI11"
+    company: "Energisa"
+    type: "UNT N2"
+    theoretical_qty: 325503046
+    weight_pct: 3.786
+    subsector: "distribuicao"
+    liquidity_tier: 2
+
+  - ticker: "AXIA6"
+    company: "Axia Energia PNB"
+    type: "PNB N1"
+    theoretical_qty: 189746935
+    weight_pct: 2.708
+    subsector: "transmissao"
+    liquidity_tier: 2
+
+  - ticker: "EGIE3"
+    company: "Engie Brasil"
+    type: "ON NM"
+    theoretical_qty: 357310487
+    weight_pct: 2.637
+    subsector: "geracao"
+    liquidity_tier: 2
+
+  - ticker: "ISAE4"
+    company: "Isa Energia"
+    type: "PN N1"
+    theoretical_qty: 395801044
+    weight_pct: 2.587
+    subsector: "transmissao"
+    liquidity_tier: 2
+
+  - ticker: "CSMG3"
+    company: "Copasa"
+    type: "ON NM"
+    theoretical_qty: 188467895
+    weight_pct: 2.440
+    subsector: "saneamento"
+    liquidity_tier: 2
+
+  - ticker: "TAEE11"
+    company: "Taesa"
+    type: "UNT N2"
+    theoretical_qty: 218568234
+    weight_pct: 2.104
+    subsector: "transmissao"
+    liquidity_tier: 2
+    note: "Alta pagadora de dividendos — ideal para dividend capture"
+
+  - ticker: "SAPR11"
+    company: "Sanepar"
+    type: "UNT N2"
+    theoretical_qty: 201077478
+    weight_pct: 2.003
+    subsector: "saneamento"
+    liquidity_tier: 2
+
+  - ticker: "CPFE3"
+    company: "CPFL Energia"
+    type: "ON NM"
+    theoretical_qty: 187732538
+    weight_pct: 2.070
+    subsector: "distribuicao"
+    liquidity_tier: 2
+
+  - ticker: "NEOE3"
+    company: "Neoenergia"
+    type: "ON NM"
+    theoretical_qty: 195592180
+    weight_pct: 1.509
+    subsector: "distribuicao"
+    liquidity_tier: 2
+
+  - ticker: "ALUP11"
+    company: "Alupar"
+    type: "UNT N2"
+    theoretical_qty: 157537587
+    weight_pct: 1.262
+    subsector: "transmissao"
+    liquidity_tier: 3
+
+  - ticker: "ORVR3"
+    company: "Orizon"
+    type: "ON NM"
+    theoretical_qty: 54399873
+    weight_pct: 0.862
+    subsector: "saneamento_residuos"
+    liquidity_tier: 3
+
+  - ticker: "AURE3"
+    company: "Auren Energia"
+    type: "ON NM"
+    theoretical_qty: 317799925
+    weight_pct: 0.855
+    subsector: "geracao"
+    liquidity_tier: 3
+
+rebalance_dates:
+  - "2026-01-01"
+  - "2026-05-01"
+  - "2026-09-01"
+  - "2027-01-01"
+
+metadata:
+  validity_start: "2026-05-01"
+  validity_end: "2026-08-31"
+  base_date: "2026-03-30"
+  source: "B3 Plantão de Notícias"

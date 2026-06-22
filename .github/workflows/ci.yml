@@ -1,0 +1,87 @@
+name: CI — Tradebot-UTIL.v2
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Instalar sem MetaTrader5 (não disponível no Linux/CI)
+          grep -v "MetaTrader5" requirements.txt > requirements_ci.txt
+          pip install -r requirements_ci.txt
+          pip install pytest pytest-cov
+
+      - name: Mock MetaTrader5 for CI
+        run: |
+          echo "import sys; import types
+          mt5 = types.ModuleType('MetaTrader5')
+          mt5.TIMEFRAME_M1 = mt5.TIMEFRAME_M5 = mt5.TIMEFRAME_M15 = 1
+          mt5.TIMEFRAME_M30 = mt5.TIMEFRAME_H1 = mt5.TIMEFRAME_H4 = 1
+          mt5.TIMEFRAME_D1 = mt5.TIMEFRAME_W1 = mt5.TIMEFRAME_MN1 = 1
+          mt5.ORDER_TYPE_BUY = mt5.ORDER_TYPE_SELL = 0
+          mt5.TRADE_ACTION_DEAL = mt5.ORDER_TIME_GTC = mt5.ORDER_FILLING_IOC = 0
+          mt5.TRADE_RETCODE_DONE = 10009
+          mt5.initialize = lambda **kw: True
+          mt5.shutdown = lambda: None
+          mt5.account_info = lambda: None
+          mt5.terminal_info = lambda: True
+          mt5.symbol_info = lambda s: None
+          mt5.symbol_select = lambda s, b: True
+          mt5.copy_rates_from_pos = lambda *a, **kw: None
+          mt5.symbol_info_tick = lambda s: None
+          mt5.positions_get = lambda **kw: []
+          mt5.history_deals_get = lambda *a: []
+          mt5.order_send = lambda r: None
+          mt5.last_error = lambda: (0, 'OK')
+          sys.modules['MetaTrader5'] = mt5" > mt5_mock.py
+          python mt5_mock.py
+
+      - name: Run tests
+        env:
+          PYTHONPATH: "."
+        run: |
+          python -c "
+          import sys, types
+          mt5 = types.ModuleType('MetaTrader5')
+          for attr in ['TIMEFRAME_M1','TIMEFRAME_M5','TIMEFRAME_M15','TIMEFRAME_M30',
+                       'TIMEFRAME_H1','TIMEFRAME_H4','TIMEFRAME_D1','TIMEFRAME_W1','TIMEFRAME_MN1',
+                       'ORDER_TYPE_BUY','ORDER_TYPE_SELL','TRADE_ACTION_DEAL',
+                       'ORDER_TIME_GTC','ORDER_FILLING_IOC','TRADE_RETCODE_DONE']:
+              setattr(mt5, attr, 0 if 'DONE' not in attr else 10009)
+          mt5.initialize = lambda **kw: True
+          mt5.shutdown = lambda: None
+          mt5.account_info = lambda: None
+          mt5.terminal_info = lambda: True
+          mt5.symbol_info = lambda s: None
+          mt5.symbol_select = lambda s, b: True
+          mt5.copy_rates_from_pos = lambda *a, **kw: None
+          mt5.symbol_info_tick = lambda s: None
+          mt5.positions_get = lambda **kw: []
+          mt5.history_deals_get = lambda *a: []
+          mt5.order_send = lambda r: None
+          mt5.last_error = lambda: (0, 'OK')
+          sys.modules['MetaTrader5'] = mt5
+          " && pytest tests/test_strategies.py -v --tb=short
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: always()
+        continue-on-error: true

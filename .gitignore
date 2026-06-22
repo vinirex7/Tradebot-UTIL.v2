@@ -1,0 +1,34 @@
+# Config com credenciais (NUNCA versionar!)
+config/config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/*.log
+logs/*.csv
+logs/*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dados temporários
+*.pkl
+*.parquet
+data/cache/
