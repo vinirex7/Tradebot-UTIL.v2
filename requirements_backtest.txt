@@ -1,5 +1,5 @@
 # Dependências apenas para backtest (sem MetaTrader5 — compatível com Linux)
-yfinance==0.2.38
+yfinance>=0.2.61
 pandas==2.2.2
 numpy==1.26.4
 scipy==1.13.0

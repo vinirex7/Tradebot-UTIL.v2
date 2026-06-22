@@ -178,32 +178,40 @@ def download_data(
     end: str,
     verbose: bool = True,
 ) -> dict[str, pd.DataFrame]:
-    """Baixa OHLCV do Yahoo Finance (ajustado por dividendos e splits)."""
-    yf_tickers = [t + ".SA" for t in tickers]
-
+    """
+    Baixa OHLCV do Yahoo Finance (ajustado por dividendos e splits).
+    Baixa um ticker por vez para evitar erro de timezone com .SA.
+    """
     if verbose:
         print(f"\n  Baixando {len(tickers)} ativos de {start} até {end}...")
-
-    raw = yf.download(
-        yf_tickers,
-        start=start,
-        end=end,
-        auto_adjust=True,
-        progress=verbose,
-        threads=True,
-    )
 
     data = {}
     for ticker in tickers:
         yf_t = ticker + ".SA"
         try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                df = raw.xs(yf_t, axis=1, level=1).copy()
-            else:
-                df = raw.copy()
+            obj = yf.Ticker(yf_t)
+            df = obj.history(
+                start=start,
+                end=end,
+                auto_adjust=True,
+                actions=False,
+            )
+
+            if df.empty:
+                if verbose:
+                    print(f"    ✗ {ticker}: sem dados retornados")
+                continue
 
             df.columns = [c.lower() for c in df.columns]
-            df = df[["open", "high", "low", "close", "volume"]].dropna()
+
+            # Remover timezone do índice (compatibilidade)
+            if hasattr(df.index, 'tz') and df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+
+            # Garantir colunas corretas
+            cols_needed = ["open", "high", "low", "close", "volume"]
+            cols_available = [c for c in cols_needed if c in df.columns]
+            df = df[cols_available].dropna()
 
             if len(df) >= 50:
                 data[ticker] = df
@@ -212,6 +220,7 @@ def download_data(
             else:
                 if verbose:
                     print(f"    ✗ {ticker}: dados insuficientes ({len(df)} barras)")
+
         except Exception as e:
             if verbose:
                 print(f"    ✗ {ticker}: {e}")
@@ -222,12 +231,14 @@ def download_data(
 def download_benchmark(start: str, end: str) -> pd.Series:
     """Baixa UTLL11 como benchmark do UTIL."""
     try:
-        df = yf.download("UTLL11.SA", start=start, end=end,
-                         auto_adjust=True, progress=False)
+        obj = yf.Ticker("UTLL11.SA")
+        df = obj.history(start=start, end=end, auto_adjust=True, actions=False)
         if df.empty:
-            # Fallback: carteira igual ao UTIL com os dados disponíveis
             return pd.Series()
-        return df["Close"].dropna()
+        if hasattr(df.index, 'tz') and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df.columns = [c.lower() for c in df.columns]
+        return df["close"].dropna()
     except Exception:
         return pd.Series()
 
