@@ -161,6 +161,32 @@ class TradebotUTIL:
         logger.info("OHLCV carregado para {}/{} ativos.", len(ohlcv_dict), len(self.universe))
         return ohlcv_dict
 
+    def _get_open_positions(self) -> dict[str, dict]:
+        """Lê posições abertas do bot em paper ou live."""
+        if self.mode == "paper":
+            return self.executor.get_open_paper_positions()
+
+        positions = self.mt5.get_positions()
+        if positions is None or positions.empty:
+            return {}
+
+        if "magic" in positions.columns:
+            positions = positions[positions["magic"] == self.executor.MAGIC_NUMBER]
+
+        out: dict[str, dict] = {}
+        for _, row in positions.iterrows():
+            ticker = str(row.get("symbol", ""))
+            if not ticker:
+                continue
+            out[ticker] = {
+                "direction": "long",
+                "shares": int(row.get("volume", 0)),
+                "entry_price": float(row.get("price_open", 0.0)),
+                "strategy": "top4_rotation",
+                "order_id": str(row.get("ticket", "")),
+            }
+        return out
+
     def _update_macro(self) -> None:
         """Atualiza dados macroeconômicos usados pela estratégia legada."""
         selic = self.macro.get_selic_rate()
@@ -197,7 +223,7 @@ class TradebotUTIL:
 
     def _run_top4_rotation_cycle(self, ohlcv: dict) -> None:
         strategy = self.strategies["top4_rotation"]
-        current_positions = self.executor.get_open_positions()
+        current_positions = self._get_open_positions()
         plan = strategy.analyze_universe(
             ohlcv_by_ticker=ohlcv,
             current_positions=current_positions,
@@ -219,7 +245,7 @@ class TradebotUTIL:
                 if result:
                     self.risk.release_position(ticker)
 
-        open_after_sells = self.executor.get_open_positions()
+        open_after_sells = self._get_open_positions()
         for signal in plan.buy_signals:
             if signal.ticker in open_after_sells:
                 continue
