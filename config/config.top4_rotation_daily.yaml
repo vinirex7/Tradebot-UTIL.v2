@@ -1,5 +1,5 @@
 # ============================================================
-# Tradebot-UTIL.v2 — Configuração Live/Paper Top 4 Rotation Daily
+# Tradebot-UTIL.v2 — Configuração Best Assets Rotation Daily
 # Branch infra-1
 # ============================================================
 
@@ -12,9 +12,9 @@ mt5:
 trading:
   mode: "paper"
   capital: 100000.0
-  max_position_pct: 0.25
+  max_position_pct: 0.125
   max_drawdown_pct: 0.10
-  stop_loss_pct: 0.03
+  stop_loss_pct: 0.05
   kelly_fraction: 0.0
 
 strategies:
@@ -38,7 +38,8 @@ strategies:
     weight: 1.00
     timeframe: "D1"
     universe_source: "config/universe.yaml"
-    top_n: 4
+    top_n: 0
+    max_positions: 8
     rebalance_frequency: "daily"
     weekly_rebalance_day: "monday"
     lookback_short: 63
@@ -46,16 +47,16 @@ strategies:
     lookback_long: 252
     trend_ema: 50
     vol_lookback: 63
-    min_score: 0.00
-    exit_score: -0.25
-    hard_stop_pct: 0.03
-    max_position_pct: 0.25
+    min_score: -0.10
+    exit_score: -0.75
+    hard_stop_pct: 0.05
+    max_position_pct: 0.125
     weights:
-      momentum_3m: 0.30
-      momentum_6m: 0.30
+      momentum_3m: 0.25
+      momentum_6m: 0.35
       momentum_12m: 0.20
       trend: 0.20
-      low_volatility: 0.15
+      low_volatility: 0.10
 
   rebalance_anticipation:
     enabled: false
