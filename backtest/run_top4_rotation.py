@@ -8,6 +8,10 @@ Roda a estratégia dinâmica:
   4. Vende quem sai da seleção ou perde tendência.
   5. Compra/substitui os novos selecionados.
 
+Benchmark:
+  Usa benchmark sintético UTIL, montado com as ações do universo e seus pesos.
+  Isso evita o problema do UTLL11.SA ter histórico curto e repetir o mesmo retorno.
+
 Uso:
   python backtest/run_top4_rotation.py --start 2022-01-01 --end 2026-06-23 --capital 100000 --top-n 0 --max-positions 8 --csv
 """
@@ -23,7 +27,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtest.backtest_engine import UTIL_UNIVERSE, download_benchmark, download_data
+from backtest.backtest_engine import UTIL_UNIVERSE, download_data
 from src.strategies.top4_rotation import Top4UTILRotationStrategy
 
 
@@ -49,6 +53,31 @@ def equity_value(cash: float, positions: dict, prices: pd.Series) -> float:
     return float(value)
 
 
+def synthetic_util_benchmark(data: dict[str, pd.DataFrame], target_index: pd.Index) -> pd.Series:
+    """
+    Cria um benchmark sintético do UTIL usando os pesos do universo atual.
+    A curva é alinhada exatamente às datas da curva de equity do bot.
+    """
+    if target_index is None or len(target_index) == 0:
+        return pd.Series(dtype=float)
+
+    available = {t: df for t, df in data.items() if t in UTIL_UNIVERSE and "close" in df.columns}
+    if not available:
+        return pd.Series(dtype=float)
+
+    closes = pd.concat({ticker: df["close"] for ticker, df in available.items()}, axis=1).sort_index()
+    closes = closes.reindex(target_index).ffill().dropna(how="all")
+    if closes.empty:
+        return pd.Series(dtype=float)
+
+    weights = pd.Series({ticker: UTIL_UNIVERSE[ticker] for ticker in closes.columns}, dtype=float)
+    weights = weights / weights.sum()
+
+    normalized = closes / closes.iloc[0]
+    curve = normalized.mul(weights, axis=1).sum(axis=1)
+    return curve.dropna()
+
+
 def run_backtest(
     start: str,
     end: str,
@@ -61,7 +90,6 @@ def run_backtest(
 ) -> tuple[pd.Series, list[ClosedTrade], pd.Series]:
     tickers = list(UTIL_UNIVERSE.keys())
     data = download_data(tickers, start, end, verbose=verbose)
-    benchmark = download_benchmark(start, end)
 
     closes = pd.concat(
         {ticker: df["close"] for ticker, df in data.items() if "close" in df.columns},
@@ -164,6 +192,7 @@ def run_backtest(
         equity_points.append((dt, cash))
 
     equity = pd.Series([v for _, v in equity_points], index=[d for d, _ in equity_points]).sort_index()
+    benchmark = synthetic_util_benchmark(data, equity.index)
     return equity, trades, benchmark
 
 
@@ -190,13 +219,15 @@ def print_summary(equity: pd.Series, trades: list[ClosedTrade], benchmark: pd.Se
     print(f"  Win rate        : {win_rate:.1f}%")
 
 
-def save_csv(equity: pd.Series, trades: list[ClosedTrade]) -> None:
+def save_csv(equity: pd.Series, trades: list[ClosedTrade], benchmark: pd.Series) -> None:
     out_dir = Path("logs")
     out_dir.mkdir(exist_ok=True)
     equity.to_csv(out_dir / "top4_rotation_equity.csv", header=["equity"])
+    benchmark.to_csv(out_dir / "top4_rotation_benchmark.csv", header=["synthetic_util_benchmark"])
     pd.DataFrame([vars(t) for t in trades]).to_csv(out_dir / "top4_rotation_trades.csv", index=False)
     print("\n  Arquivos salvos:")
     print("  - logs/top4_rotation_equity.csv")
+    print("  - logs/top4_rotation_benchmark.csv")
     print("  - logs/top4_rotation_trades.csv")
 
 
@@ -223,7 +254,7 @@ def main() -> None:
     )
     print_summary(equity, trades, benchmark, args.capital)
     if args.csv:
-        save_csv(equity, trades)
+        save_csv(equity, trades, benchmark)
 
 
 if __name__ == "__main__":
