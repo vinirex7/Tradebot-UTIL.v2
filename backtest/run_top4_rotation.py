@@ -17,7 +17,6 @@ import argparse
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -93,16 +92,15 @@ def run_backtest(
     for i in range(min_i, len(closes)):
         dt = closes.index[i]
         price_row = closes.iloc[i]
-        hist = {ticker: df.loc[:dt].copy() for ticker, df in data.items() if dt in df.index or df.index[0] <= dt}
+        hist = {ticker: df.loc[:dt].copy() for ticker, df in data.items() if df.index[0] <= dt}
         current_positions = {
             ticker: {"entry_price": pos["entry_price"], "shares": pos["shares"], "strategy": "top4_rotation"}
             for ticker, pos in positions.items()
         }
 
         rebalance_due = cadence == "daily" or (cadence == "weekly" and dt.strftime("%A").lower() == "monday")
-        plan = strategy.analyze_universe(hist, current_positions=current_positions, rebalance_due=rebalance_due)
+        plan = strategy.analyze_universe(hist, current_positions=current_positions, force_rebalance=rebalance_due)
 
-        # Fechar posições com sinal de saída/substituição
         for ticker in list(plan.sell_tickers):
             if ticker not in positions or pd.isna(price_row.get(ticker)):
                 continue
@@ -113,10 +111,8 @@ def run_backtest(
             cash += gross - fee
             pnl = (px - pos["entry_price"]) * pos["shares"] - fee
             ret = (px / pos["entry_price"] - 1) * 100
-            reason = "rotation_exit"
-            trades.append(ClosedTrade(ticker, pos["entry_date"], dt, pos["entry_price"], px, pos["shares"], pnl, ret, reason))
+            trades.append(ClosedTrade(ticker, pos["entry_date"], dt, pos["entry_price"], px, pos["shares"], pnl, ret, "rotation_exit"))
 
-        # Comprar novas Top 4 no dia de rebalanceamento
         if rebalance_due:
             eq = equity_value(cash, positions, price_row)
             target_capital = eq / top_n
@@ -145,7 +141,6 @@ def run_backtest(
 
         equity_points.append((dt, equity_value(cash, positions, price_row)))
 
-    # Fechar no fim do período para relatório de trades
     if not closes.empty:
         dt = closes.index[-1]
         price_row = closes.iloc[-1]
