@@ -1,17 +1,13 @@
 """
 Estratégia: UTIL Top 4 Rotation
 ───────────────────────────────
-Seleciona dinamicamente as 4 melhores ações do universo UTIL por score
+Seleciona dinamicamente as melhores ações do universo UTIL por score
 cross-sectional de força relativa, momentum, tendência e risco.
 
-Fluxo operacional:
-  1. Lê todos os ativos do UTIL carregados no universo.
-  2. Calcula score por ativo.
-  3. Ranqueia e mantém apenas o Top N.
-  4. Fecha posições que saem do Top N ou perdem tendência.
-  5. Abre posições nos novos Top N, em alocação igualitária.
-
-Long-only, sem short, sem alavancagem, sem martingale.
+Correção importante:
+- Rebalanceamento NÃO significa vender tudo.
+- A posição só é vendida se saiu do Top N, perdeu tendência, bateu stop,
+  ou ficou com score muito ruim.
 """
 from __future__ import annotations
 
@@ -98,7 +94,6 @@ class Top4UTILRotationStrategy:
         return max(self.lookback_long, self.trend_ema, self.vol_lookback) + 5
 
     def should_rebalance(self, dt: Optional[datetime] = None) -> bool:
-        """Define se a rotação deve trocar carteira hoje."""
         if self.rebalance_frequency == "daily":
             return True
         if self.rebalance_frequency == "weekly":
@@ -112,30 +107,12 @@ class Top4UTILRotationStrategy:
         for ticker in self.universe:
             df = ohlcv_by_ticker.get(ticker)
             if df is None or df.empty or "close" not in df.columns or len(df) < self.min_bars:
-                raw_rows.append({
-                    "ticker": ticker,
-                    "eligible": False,
-                    "reason": "dados_insuficientes",
-                    "momentum_3m": np.nan,
-                    "momentum_6m": np.nan,
-                    "momentum_12m": np.nan,
-                    "trend_strength": np.nan,
-                    "volatility_3m": np.nan,
-                })
+                raw_rows.append(self._empty_row(ticker, "dados_insuficientes"))
                 continue
 
             close = df["close"].dropna()
             if len(close) < self.min_bars or close.iloc[-1] <= 0:
-                raw_rows.append({
-                    "ticker": ticker,
-                    "eligible": False,
-                    "reason": "historico_invalido",
-                    "momentum_3m": np.nan,
-                    "momentum_6m": np.nan,
-                    "momentum_12m": np.nan,
-                    "trend_strength": np.nan,
-                    "volatility_3m": np.nan,
-                })
+                raw_rows.append(self._empty_row(ticker, "historico_invalido"))
                 continue
 
             last = float(close.iloc[-1])
@@ -184,8 +161,9 @@ class Top4UTILRotationStrategy:
             )
             raw.loc[eligible.index, "score"] = eligible["score"]
 
-        scores = [
-            RotationScore(
+        scores = []
+        for row in raw.sort_values("score", ascending=False).itertuples(index=False):
+            scores.append(RotationScore(
                 ticker=str(row.ticker),
                 score=float(row.score),
                 momentum_3m=float(row.momentum_3m) if pd.notna(row.momentum_3m) else 0.0,
@@ -195,9 +173,7 @@ class Top4UTILRotationStrategy:
                 volatility_3m=float(row.volatility_3m) if pd.notna(row.volatility_3m) else 0.0,
                 eligible=bool(row.eligible),
                 reason=str(row.reason),
-            )
-            for row in raw.sort_values("score", ascending=False).itertuples(index=False)
-        ]
+            ))
         return scores
 
     def analyze_universe(
@@ -225,7 +201,7 @@ class Top4UTILRotationStrategy:
             hard_stop = entry > 0 and close < entry * (1 - self.hard_stop_pct)
             out_of_top = ticker not in top
             score_exit = score_obj is not None and score_obj.score < self.exit_score
-            if below_trend or hard_stop or out_of_top or score_exit or force_rebalance:
+            if below_trend or hard_stop or out_of_top or score_exit:
                 sell_tickers.append(ticker)
 
         buy_signals: list[TradeSignal] = []
@@ -261,12 +237,7 @@ class Top4UTILRotationStrategy:
             "[Top4Rotation] Top {}: {} | compras={} | vendas={}",
             self.top_n, top, [s.ticker for s in buy_signals], sell_tickers,
         )
-        return RotationPlan(
-            top_tickers=top,
-            scores=scores,
-            buy_signals=buy_signals,
-            sell_tickers=sell_tickers,
-        )
+        return RotationPlan(top, scores, buy_signals, sell_tickers)
 
     def _below_trend(self, df: pd.DataFrame) -> bool:
         if df is None or df.empty or len(df) < self.trend_ema + 2:
@@ -274,3 +245,16 @@ class Top4UTILRotationStrategy:
         close = df["close"].dropna()
         trend = ema(close, self.trend_ema)
         return float(close.iloc[-1]) < float(trend.iloc[-1]) * 0.99
+
+    @staticmethod
+    def _empty_row(ticker: str, reason: str) -> dict:
+        return {
+            "ticker": ticker,
+            "eligible": False,
+            "reason": reason,
+            "momentum_3m": np.nan,
+            "momentum_6m": np.nan,
+            "momentum_12m": np.nan,
+            "trend_strength": np.nan,
+            "volatility_3m": np.nan,
+        }
