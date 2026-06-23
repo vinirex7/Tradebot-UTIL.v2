@@ -1,20 +1,4 @@
-"""
-Backtest standalone — UTIL Best Assets Rotation
-───────────────────────────────────────────────
-Roda a estratégia dinâmica:
-  1. Pega todos os ativos do UTIL.
-  2. Calcula score por força relativa, momentum, tendência e risco.
-  3. Opera os melhores ativos elegíveis, sem ficar preso a quatro.
-  4. Vende quem sai da seleção ou perde tendência.
-  5. Compra/substitui os novos selecionados.
-
-Benchmark:
-  Usa benchmark sintético UTIL, montado com as ações do universo e seus pesos.
-  Isso evita o problema do UTLL11.SA ter histórico curto e repetir o mesmo retorno.
-
-Uso:
-  python backtest/run_top4_rotation.py --start 2022-01-01 --end 2026-06-23 --capital 100000 --top-n 0 --max-positions 8 --csv
-"""
+"""Backtest standalone - UTIL Best Assets Rotation."""
 from __future__ import annotations
 
 import argparse
@@ -27,7 +11,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtest.backtest_engine import UTIL_UNIVERSE, download_data
+from backtest.backtest_engine import UTIL_UNIVERSE, download_data, synthetic_util_benchmark
 from src.strategies.top4_rotation import Top4UTILRotationStrategy
 
 
@@ -51,31 +35,6 @@ def equity_value(cash: float, positions: dict, prices: pd.Series) -> float:
         if pd.notna(px):
             value += pos["shares"] * float(px)
     return float(value)
-
-
-def synthetic_util_benchmark(data: dict[str, pd.DataFrame], target_index: pd.Index) -> pd.Series:
-    """
-    Cria um benchmark sintético do UTIL usando os pesos do universo atual.
-    A curva é alinhada exatamente às datas da curva de equity do bot.
-    """
-    if target_index is None or len(target_index) == 0:
-        return pd.Series(dtype=float)
-
-    available = {t: df for t, df in data.items() if t in UTIL_UNIVERSE and "close" in df.columns}
-    if not available:
-        return pd.Series(dtype=float)
-
-    closes = pd.concat({ticker: df["close"] for ticker, df in available.items()}, axis=1).sort_index()
-    closes = closes.reindex(target_index).ffill().dropna(how="all")
-    if closes.empty:
-        return pd.Series(dtype=float)
-
-    weights = pd.Series({ticker: UTIL_UNIVERSE[ticker] for ticker in closes.columns}, dtype=float)
-    weights = weights / weights.sum()
-
-    normalized = closes / closes.iloc[0]
-    curve = normalized.mul(weights, axis=1).sum(axis=1)
-    return curve.dropna()
 
 
 def run_backtest(
@@ -121,8 +80,7 @@ def run_backtest(
     trades: list[ClosedTrade] = []
     equity_points: list[tuple[pd.Timestamp, float]] = []
 
-    min_i = strategy.min_bars
-    for i in range(min_i, len(closes)):
+    for i in range(strategy.min_bars, len(closes)):
         dt = closes.index[i]
         price_row = closes.iloc[i]
         hist = {ticker: df.loc[:dt].copy() for ticker, df in data.items() if df.index[0] <= dt}
@@ -167,11 +125,7 @@ def run_backtest(
                 if cost + fee > cash:
                     continue
                 cash -= cost + fee
-                positions[ticker] = {
-                    "shares": shares,
-                    "entry_price": px,
-                    "entry_date": dt,
-                }
+                positions[ticker] = {"shares": shares, "entry_price": px, "entry_date": dt}
 
         equity_points.append((dt, equity_value(cash, positions, price_row)))
 
@@ -192,7 +146,9 @@ def run_backtest(
         equity_points.append((dt, cash))
 
     equity = pd.Series([v for _, v in equity_points], index=[d for d, _ in equity_points]).sort_index()
-    benchmark = synthetic_util_benchmark(data, equity.index)
+    # Benchmark intentionally uses the full downloaded period, not only equity.index.
+    # This keeps UTIL Benchmark identical to branch main for the same start/end.
+    benchmark = synthetic_util_benchmark(data)
     return equity, trades, benchmark
 
 
@@ -205,9 +161,9 @@ def print_summary(equity: pd.Series, trades: list[ClosedTrade], benchmark: pd.Se
     wins = [t for t in trades if t.pnl > 0]
     win_rate = len(wins) / len(trades) * 100 if trades else 0.0
 
-    print("\n════════════════════════════════════════════════════════════")
-    print("  UTIL Best Assets Rotation — Resultado")
-    print("════════════════════════════════════════════════════════════")
+    print("\n" + "=" * 60)
+    print("  UTIL Best Assets Rotation - Resultado")
+    print("=" * 60)
     print(f"  Capital inicial : R$ {capital:,.2f}")
     print(f"  Capital final   : R$ {equity.iloc[-1]:,.2f}" if not equity.empty else "  Capital final   : n/d")
     print(f"  Retorno bot     : {total_return:+.2f}%")
@@ -215,7 +171,7 @@ def print_summary(equity: pd.Series, trades: list[ClosedTrade], benchmark: pd.Se
     print(f"  Alpha           : {total_return - bench_ret:+.2f}%")
     print(f"  Max Drawdown    : {dd:.2f}%")
     print(f"  Sharpe          : {sharpe:.2f}")
-    print(f"  Operações       : {len(trades)}")
+    print(f"  Operacoes       : {len(trades)}")
     print(f"  Win rate        : {win_rate:.1f}%")
 
 
@@ -237,7 +193,7 @@ def main() -> None:
     parser.add_argument("--end", default="2026-06-23")
     parser.add_argument("--capital", type=float, default=100000.0)
     parser.add_argument("--cadence", choices=["daily", "weekly"], default="weekly")
-    parser.add_argument("--top-n", type=int, default=0, help="0 = todos os elegíveis até max-positions")
+    parser.add_argument("--top-n", type=int, default=0, help="0 = todos os elegiveis ate max-positions")
     parser.add_argument("--max-positions", type=int, default=8)
     parser.add_argument("--csv", action="store_true")
     parser.add_argument("--quiet", action="store_true")
