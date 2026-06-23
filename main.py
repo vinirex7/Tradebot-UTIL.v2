@@ -1,29 +1,32 @@
 """
 Tradebot-UTIL.v2 — Entry Point Principal
 ─────────────────────────────────────────
-Orquestra todas as estratégias, feeds de dados e execução de ordens.
+Orquestra estratégias, feeds de dados e execução de ordens.
+
 Uso:
-    python main.py --mode paper       # Paper trading (padrão)
-    python main.py --mode live        # Live trading (use com cuidado!)
-    python main.py --mode backtest    # Backtest (use run_backtest.py)
+    python main.py --mode paper --config config/config.top4_rotation.yaml
+    python main.py --mode live  --config config/config.top4_rotation.yaml
+    python backtest/run_backtest.py --strategy top4_rotation
 """
 import argparse
 import sys
 import time
-import schedule
 from pathlib import Path
+
+import schedule
 import yaml
 from loguru import logger
 
-from src.utils.logger import setup_logger
-from src.data.mt5_feed import MT5Feed
 from src.data.macro_feed import MacroFeed
-from src.risk.risk_manager import RiskManager
+from src.data.mt5_feed import MT5Feed
 from src.execution.order_executor import OrderExecutor
+from src.risk.risk_manager import RiskManager
 from src.strategies import (
     MomentumMacroStrategy,
     RebalanceAnticipationStrategy,
+    Top4UTILRotationStrategy,
 )
+from src.utils.logger import setup_logger
 
 
 def load_config(path: str = "config/config.yaml") -> dict:
@@ -38,7 +41,6 @@ class TradebotUTIL:
         self.cfg = config
         self.mode = config["trading"]["mode"]
 
-        # Setup logger
         setup_logger(
             log_file=config["logging"]["file"],
             level=config["logging"]["level"],
@@ -47,7 +49,6 @@ class TradebotUTIL:
         logger.info("Tradebot-UTIL.v2 iniciando | Modo: {}", self.mode)
         logger.info("=" * 60)
 
-        # Feeds de dados
         mt5_cfg = config["mt5"]
         self.mt5 = MT5Feed(
             login=mt5_cfg["login"],
@@ -57,7 +58,6 @@ class TradebotUTIL:
         )
         self.macro = MacroFeed()
 
-        # Risk Manager
         t_cfg = config["trading"]
         self.risk = RiskManager(
             capital=t_cfg["capital"],
@@ -67,41 +67,57 @@ class TradebotUTIL:
             kelly_fraction=t_cfg["kelly_fraction"],
         )
 
-        # Executor de ordens
         self.executor = OrderExecutor(mode=self.mode)
         self.executor.set_paper_capital(t_cfg["capital"])
 
-        # Estratégias
+        with open("config/universe.yaml", "r") as f:
+            universe_cfg = yaml.safe_load(f)
+        self.universe = [a["ticker"] for a in universe_cfg["util_composition"]]
+
         s_cfg = config["strategies"]
+        rot_cfg = s_cfg.get("top4_rotation", {})
+        rot_w = rot_cfg.get("weights", {})
+
         self.strategies = {
             "momentum_macro": MomentumMacroStrategy(
                 ema_fast=s_cfg["momentum_macro"]["ema_fast"],
                 ema_mid=s_cfg["momentum_macro"]["ema_mid"],
                 ema_slow=s_cfg["momentum_macro"]["ema_slow"],
                 di1_threshold=s_cfg["momentum_macro"]["di1_threshold"],
+                macro_filter_enabled=s_cfg["momentum_macro"].get("macro_filter_enabled", False),
                 assets=s_cfg["momentum_macro"]["assets"],
+            ),
+            "top4_rotation": Top4UTILRotationStrategy(
+                universe=self.universe,
+                top_n=rot_cfg.get("top_n", 4),
+                rebalance_frequency=rot_cfg.get("rebalance_frequency", "weekly"),
+                weekly_rebalance_day=rot_cfg.get("weekly_rebalance_day", "monday"),
+                lookback_short=rot_cfg.get("lookback_short", 63),
+                lookback_mid=rot_cfg.get("lookback_mid", 126),
+                lookback_long=rot_cfg.get("lookback_long", 252),
+                trend_ema=rot_cfg.get("trend_ema", 50),
+                vol_lookback=rot_cfg.get("vol_lookback", 63),
+                min_score=rot_cfg.get("min_score", 0.0),
+                exit_score=rot_cfg.get("exit_score", -0.25),
+                hard_stop_pct=rot_cfg.get("hard_stop_pct", t_cfg["stop_loss_pct"]),
+                max_position_pct=rot_cfg.get("max_position_pct", t_cfg["max_position_pct"]),
+                w_mom_short=rot_w.get("momentum_3m", 0.30),
+                w_mom_mid=rot_w.get("momentum_6m", 0.30),
+                w_mom_long=rot_w.get("momentum_12m", 0.20),
+                w_trend=rot_w.get("trend", 0.20),
+                w_low_vol=rot_w.get("low_volatility", 0.15),
             ),
             "rebalance_anticipation": RebalanceAnticipationStrategy(
                 days_before=s_cfg["rebalance_anticipation"]["days_before_rebalance"],
             ),
         }
 
-        # Universo de ativos
-        with open("config/universe.yaml", "r") as f:
-            universe_cfg = yaml.safe_load(f)
-        self.universe = [a["ticker"] for a in universe_cfg["util_composition"]]
-
-        # Pesos das estratégias para alocação de capital
         self.strategy_weights = {
-            "momentum_macro": s_cfg["momentum_macro"]["weight"],
-            "rebalance_anticipation": s_cfg["rebalance_anticipation"]["weight"],
+            "momentum_macro": s_cfg["momentum_macro"].get("weight", 0.0),
+            "top4_rotation": rot_cfg.get("weight", 0.0),
+            "rebalance_anticipation": s_cfg["rebalance_anticipation"].get("weight", 0.0),
         }
-
         self._running = False
-
-    # ──────────────────────────────────────────────
-    # Inicialização
-    # ──────────────────────────────────────────────
 
     def start(self) -> None:
         """Inicia o bot."""
@@ -112,11 +128,7 @@ class TradebotUTIL:
             logger.info("Conexão MT5 estabelecida.")
 
         self._running = True
-
-        # Atualizar macro na inicialização
         self._update_macro()
-
-        # Agendar tarefas (ciclo intraday removido — mean_reversion excluído)
         self._schedule_jobs()
 
         logger.info("Bot ativo. Pressione Ctrl+C para encerrar.")
@@ -133,29 +145,14 @@ class TradebotUTIL:
         self.mt5.disconnect()
         self._print_summary()
 
-    # ──────────────────────────────────────────────
-    # Agendamento de tarefas
-    # ──────────────────────────────────────────────
-
     def _schedule_jobs(self) -> None:
-        """Define horários de execução das rotinas."""
-        # Análise diária (abertura do pregão)
         schedule.every().day.at("10:05").do(self._run_daily_cycle)
-
-        # Atualização de dados macro (a cada 4h)
         schedule.every(4).hours.do(self._update_macro)
-
-        # Relatório de portfólio (fim do dia)
         schedule.every().day.at("17:15").do(self._print_summary)
+        logger.info("Agendamento configurado: ciclo diário 10:05, resumo 17:15.")
 
-        logger.info("Agendamento configurado.")
-
-    # ──────────────────────────────────────────────
-    # Ciclos de análise
-    # ──────────────────────────────────────────────
-
-    def _load_ohlcv_all(self, timeframe: str = "D1", n_bars: int = 300) -> dict:
-        """Carrega OHLCV de todos os ativos do universo."""
+    def _load_ohlcv_all(self, timeframe: str = "D1", n_bars: int = 320) -> dict:
+        """Carrega OHLCV de todos os ativos do universo UTIL."""
         ohlcv_dict = {}
         for ticker in self.universe:
             df = self.mt5.get_ohlcv(ticker, timeframe, n_bars=n_bars)
@@ -165,68 +162,97 @@ class TradebotUTIL:
         return ohlcv_dict
 
     def _update_macro(self) -> None:
-        """Atualiza dados macroeconômicos e ajusta estratégia de momentum."""
+        """Atualiza dados macroeconômicos usados pela estratégia legada."""
         selic = self.macro.get_selic_rate()
         focus = self.macro.get_di_futures()
-
         if selic:
-            focus_1y = None
-            if focus:
-                focus_1y = list(focus.values())[0] if focus else None
+            focus_1y = list(focus.values())[0] if focus else None
             regime = self.macro.get_rate_regime(selic, focus_1y)
             self.strategies["momentum_macro"].set_macro_regime(regime)
             logger.info("Macro atualizado | Selic={:.2f}% | Regime={}", selic * 100, regime)
 
     def _run_daily_cycle(self) -> None:
-        """Ciclo diário: Momentum Macro + antecipação de rebalanceamento."""
+        """Ciclo diário: ranking UTIL, substituição Top 4 e estratégias opcionais."""
         if not self.risk.is_trading_allowed():
             return
 
         logger.info("── Ciclo diário iniciado ──")
-        ohlcv = self._load_ohlcv_all(timeframe="D1", n_bars=300)
+        n_bars = self.cfg.get("data", {}).get("price_history_days", 320)
+        ohlcv = self._load_ohlcv_all(timeframe="D1", n_bars=n_bars)
 
-        # Momentum Macro — única estratégia ativa (100% do capital)
-        if self.cfg["strategies"]["momentum_macro"]["enabled"]:
+        if self.cfg["strategies"].get("top4_rotation", {}).get("enabled", False):
+            self._run_top4_rotation_cycle(ohlcv)
+
+        if self.cfg["strategies"].get("momentum_macro", {}).get("enabled", False):
             for ticker in self.strategies["momentum_macro"].assets:
                 if ticker in ohlcv:
                     signal = self.strategies["momentum_macro"].analyze(ticker, ohlcv[ticker])
                     if signal:
                         self._process_signal(signal, "momentum_macro")
 
-        # Antecipação de Rebalanceamento
-        if self.cfg["strategies"]["rebalance_anticipation"]["enabled"]:
+        if self.cfg["strategies"].get("rebalance_anticipation", {}).get("enabled", False):
             reb_signals = self.strategies["rebalance_anticipation"].scan(ohlcv)
             for signal in reb_signals:
                 self._process_signal(signal, "rebalance_anticipation")
 
-    # ──────────────────────────────────────────────
-    # Processamento de sinais
-    # ──────────────────────────────────────────────
+    def _run_top4_rotation_cycle(self, ohlcv: dict) -> None:
+        strategy = self.strategies["top4_rotation"]
+        current_positions = self.executor.get_open_positions()
+        plan = strategy.analyze_universe(
+            ohlcv_by_ticker=ohlcv,
+            current_positions=current_positions,
+            force_rebalance=False,
+        )
+
+        logger.info("[Top4Rotation] Ranking:")
+        for item in plan.scores[:10]:
+            logger.info(
+                "  {} | score={:.3f} | elegivel={} | motivo={} | m3={:.1%} m6={:.1%} m12={:.1%} vol={:.1%}",
+                item.ticker, item.score, item.eligible, item.reason,
+                item.momentum_3m, item.momentum_6m, item.momentum_12m, item.volatility_3m,
+            )
+
+        for ticker in plan.sell_tickers:
+            if ticker in ohlcv:
+                price = float(ohlcv[ticker]["close"].iloc[-1])
+                result = self.executor.close_position(ticker, price)
+                if result:
+                    self.risk.release_position(ticker)
+
+        open_after_sells = self.executor.get_open_positions()
+        for signal in plan.buy_signals:
+            if signal.ticker in open_after_sells:
+                continue
+            self._process_signal(signal, "top4_rotation")
 
     def _process_signal(self, signal, strategy_name: str) -> None:
         """Calcula position size e envia ordem."""
-        # Ajustar capital disponível por peso da estratégia
-        weight = self.strategy_weights.get(strategy_name, 0.1)
+        weight = self.strategy_weights.get(strategy_name, 0.0)
+        if weight <= 0:
+            logger.warning("Estratégia {} com peso zero. Sinal ignorado.", strategy_name)
+            return
+
         strategy_capital = self.risk.current_capital * weight
         effective_risk = RiskManager(
             capital=strategy_capital,
             max_pos_pct=self.risk.max_pos_pct,
             stop_loss_pct=self.risk.stop_loss_pct,
             max_drawdown=self.risk.max_drawdown,
-            kelly_fraction=self.risk.kelly_fraction,
+            kelly_fraction=max(self.risk.kelly_fraction, 1.0),
         )
 
-        pos_size = effective_risk.calculate_position_size(signal)
+        pos_size = effective_risk.calculate_position_size(
+            signal,
+            win_rate=0.60,
+            avg_win=0.05,
+            avg_loss=0.025,
+        )
         if pos_size is None:
             return
 
         result = self.executor.send_order(signal, pos_size)
         if result:
             self.risk.register_open_position(signal.ticker, pos_size.capital_allocated)
-
-    # ──────────────────────────────────────────────
-    # Relatório
-    # ──────────────────────────────────────────────
 
     def _print_summary(self) -> None:
         """Imprime resumo do portfólio."""
@@ -248,10 +274,6 @@ class TradebotUTIL:
                 logger.info("Operações paper:\n{}", paper_df.to_string())
 
 
-# ─────────────────────────────────────────────────────────
-# Execução
-# ─────────────────────────────────────────────────────────
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Tradebot-UTIL.v2")
     parser.add_argument(
@@ -268,16 +290,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-
     config_path = args.config
     if not Path(config_path).exists():
         print(f"[ERRO] Arquivo de configuração não encontrado: {config_path}")
-        print("Execute: cp config/config.example.yaml config/config.yaml")
-        print("E preencha com suas credenciais MT5/XP Investimentos.")
+        print("Execute: cp config/config.top4_rotation.yaml config/config.yaml")
         sys.exit(1)
 
     config = load_config(config_path)
-    config["trading"]["mode"] = args.mode  # Override pelo argumento CLI
+    config["trading"]["mode"] = args.mode
 
     bot = TradebotUTIL(config)
     bot.start()
