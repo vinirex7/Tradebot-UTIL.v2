@@ -8,6 +8,8 @@ Uso:
     python main.py --mode live  --config config/config.top4_rotation.yaml
     python backtest/run_top4_rotation.py --top-n 0 --max-positions 8
 """
+from __future__ import annotations
+
 import argparse
 import sys
 import time
@@ -118,6 +120,7 @@ class TradebotUTIL:
             "top4_rotation": rot_cfg.get("weight", 0.0),
             "rebalance_anticipation": s_cfg["rebalance_anticipation"].get("weight", 0.0),
         }
+        self._dynamic_max_pos_pct: dict[str, float] = {}
         self._running = False
 
     def start(self) -> None:
@@ -226,6 +229,9 @@ class TradebotUTIL:
             force_rebalance=False,
         )
 
+        selected_count = max(1, len(plan.top_tickers))
+        self._dynamic_max_pos_pct["top4_rotation"] = 1 / selected_count
+
         logger.info("[BestAssetsRotation] Ranking:")
         for item in plan.scores[:10]:
             logger.info(
@@ -254,9 +260,10 @@ class TradebotUTIL:
             return
 
         strategy_capital = self.risk.current_capital * weight
+        max_pos_pct = self._dynamic_max_pos_pct.get(strategy_name, self.risk.max_pos_pct)
         effective_risk = RiskManager(
             capital=strategy_capital,
-            max_pos_pct=self.risk.max_pos_pct,
+            max_pos_pct=max_pos_pct,
             stop_loss_pct=self.risk.stop_loss_pct,
             max_drawdown=self.risk.max_drawdown,
             kelly_fraction=max(self.risk.kelly_fraction, 1.0),
