@@ -1,15 +1,15 @@
 """
-Backtest standalone — UTIL Top 4 Rotation
-─────────────────────────────────────────
-Roda a nova estratégia dinâmica:
+Backtest standalone — UTIL Best Assets Rotation
+───────────────────────────────────────────────
+Roda a estratégia dinâmica:
   1. Pega todos os ativos do UTIL.
   2. Calcula score por força relativa, momentum, tendência e risco.
-  3. Mantém apenas as Top 4.
-  4. Vende quem sai do Top 4 ou perde tendência.
-  5. Compra/substitui as novas Top 4.
+  3. Opera os melhores ativos elegíveis, sem ficar preso a quatro.
+  4. Vende quem sai da seleção ou perde tendência.
+  5. Compra/substitui os novos selecionados.
 
 Uso:
-  python backtest/run_top4_rotation.py --start 2022-01-01 --end 2026-06-23 --capital 100000 --csv
+  python backtest/run_top4_rotation.py --start 2022-01-01 --end 2026-06-23 --capital 100000 --top-n 0 --max-positions 8 --csv
 """
 from __future__ import annotations
 
@@ -53,8 +53,9 @@ def run_backtest(
     start: str,
     end: str,
     capital: float,
-    cadence: str = "daily",
-    top_n: int = 4,
+    cadence: str = "weekly",
+    top_n: int = 0,
+    max_positions: int = 8,
     fee_pct: float = 0.0005,
     verbose: bool = True,
 ) -> tuple[pd.Series, list[ClosedTrade], pd.Series]:
@@ -67,9 +68,13 @@ def run_backtest(
         axis=1,
     ).dropna(how="all")
 
+    active_slots = top_n if top_n > 0 else max_positions
+    active_slots = max(1, active_slots)
+
     strategy = Top4UTILRotationStrategy(
         universe=[t for t in tickers if t in data],
         top_n=top_n,
+        max_positions=max_positions,
         rebalance_frequency=cadence,
         weekly_rebalance_day="monday",
         lookback_short=63,
@@ -77,10 +82,10 @@ def run_backtest(
         lookback_long=252,
         trend_ema=50,
         vol_lookback=63,
-        min_score=0.0,
-        exit_score=-0.25,
-        hard_stop_pct=0.03,
-        max_position_pct=1 / top_n,
+        min_score=-0.10,
+        exit_score=-0.75,
+        hard_stop_pct=0.05,
+        max_position_pct=1 / active_slots,
     )
 
     cash = float(capital)
@@ -99,7 +104,7 @@ def run_backtest(
         }
 
         rebalance_due = cadence == "daily" or (cadence == "weekly" and dt.strftime("%A").lower() == "monday")
-        plan = strategy.analyze_universe(hist, current_positions=current_positions, force_rebalance=rebalance_due)
+        plan = strategy.analyze_universe(hist, current_positions=current_positions, force_rebalance=False)
 
         for ticker in list(plan.sell_tickers):
             if ticker not in positions or pd.isna(price_row.get(ticker)):
@@ -114,8 +119,9 @@ def run_backtest(
             trades.append(ClosedTrade(ticker, pos["entry_date"], dt, pos["entry_price"], px, pos["shares"], pnl, ret, "rotation_exit"))
 
         if rebalance_due:
+            selected_count = max(1, len(plan.top_tickers))
             eq = equity_value(cash, positions, price_row)
-            target_capital = eq / top_n
+            target_capital = eq / selected_count
             for signal in plan.buy_signals:
                 ticker = signal.ticker
                 if ticker in positions or pd.isna(price_row.get(ticker)):
@@ -171,7 +177,7 @@ def print_summary(equity: pd.Series, trades: list[ClosedTrade], benchmark: pd.Se
     win_rate = len(wins) / len(trades) * 100 if trades else 0.0
 
     print("\n════════════════════════════════════════════════════════════")
-    print("  UTIL Top 4 Rotation — Resultado")
+    print("  UTIL Best Assets Rotation — Resultado")
     print("════════════════════════════════════════════════════════════")
     print(f"  Capital inicial : R$ {capital:,.2f}")
     print(f"  Capital final   : R$ {equity.iloc[-1]:,.2f}" if not equity.empty else "  Capital final   : n/d")
@@ -195,12 +201,13 @@ def save_csv(equity: pd.Series, trades: list[ClosedTrade]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest UTIL Top 4 Rotation via yfinance")
+    parser = argparse.ArgumentParser(description="Backtest UTIL Best Assets Rotation via yfinance")
     parser.add_argument("--start", default="2019-01-01")
     parser.add_argument("--end", default="2026-06-23")
     parser.add_argument("--capital", type=float, default=100000.0)
-    parser.add_argument("--cadence", choices=["daily", "weekly"], default="daily")
-    parser.add_argument("--top-n", type=int, default=4)
+    parser.add_argument("--cadence", choices=["daily", "weekly"], default="weekly")
+    parser.add_argument("--top-n", type=int, default=0, help="0 = todos os elegíveis até max-positions")
+    parser.add_argument("--max-positions", type=int, default=8)
     parser.add_argument("--csv", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -211,6 +218,7 @@ def main() -> None:
         capital=args.capital,
         cadence=args.cadence,
         top_n=args.top_n,
+        max_positions=args.max_positions,
         verbose=not args.quiet,
     )
     print_summary(equity, trades, benchmark, args.capital)
