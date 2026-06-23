@@ -1,0 +1,80 @@
+# ============================================================
+# Tradebot-UTIL.v2 — Configuração Live/Paper Top 4 Rotation Daily
+# Branch infra-1
+# ============================================================
+
+mt5:
+  login: 0
+  password: ""
+  server: "XP Investimentos-Real"
+  timeout: 60000
+
+trading:
+  mode: "paper"
+  capital: 100000.0
+  max_position_pct: 0.25
+  max_drawdown_pct: 0.10
+  stop_loss_pct: 0.03
+  kelly_fraction: 0.0
+
+strategies:
+  momentum_macro:
+    enabled: false
+    weight: 0.00
+    timeframe: "D1"
+    ema_fast: 9
+    ema_mid: 21
+    ema_slow: 50
+    di1_threshold: 0.1200
+    macro_filter_enabled: false
+    assets:
+      - "SBSP3"
+      - "EQTL3"
+      - "ENEV3"
+      - "CPLE3"
+
+  top4_rotation:
+    enabled: true
+    weight: 1.00
+    timeframe: "D1"
+    universe_source: "config/universe.yaml"
+    top_n: 4
+    rebalance_frequency: "daily"
+    weekly_rebalance_day: "monday"
+    lookback_short: 63
+    lookback_mid: 126
+    lookback_long: 252
+    trend_ema: 50
+    vol_lookback: 63
+    min_score: 0.00
+    exit_score: -0.25
+    hard_stop_pct: 0.03
+    max_position_pct: 0.25
+    weights:
+      momentum_3m: 0.30
+      momentum_6m: 0.30
+      momentum_12m: 0.20
+      trend: 0.20
+      low_volatility: 0.15
+
+  rebalance_anticipation:
+    enabled: false
+    weight: 0.00
+    days_before_rebalance: 5
+    rebalance_months: [1, 5, 9]
+
+data:
+  price_history_days: 320
+  adjusted_prices: true
+  selic_update_interval: 3600
+
+notifications:
+  enabled: false
+  telegram_token: ""
+  telegram_chat_id: ""
+
+logging:
+  level: "INFO"
+  file: "logs/tradebot.log"
+  rotation: "1 day"
+  retention: "30 days"
