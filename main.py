@@ -6,7 +6,7 @@ Orquestra estratégias, feeds de dados e execução de ordens.
 Uso:
     python main.py --mode paper --config config/config.top4_rotation.yaml
     python main.py --mode live  --config config/config.top4_rotation.yaml
-    python backtest/run_backtest.py --strategy top4_rotation
+    python backtest/run_top4_rotation.py --top-n 0 --max-positions 8
 """
 import argparse
 import sys
@@ -89,7 +89,8 @@ class TradebotUTIL:
             ),
             "top4_rotation": Top4UTILRotationStrategy(
                 universe=self.universe,
-                top_n=rot_cfg.get("top_n", 4),
+                top_n=rot_cfg.get("top_n", 0),
+                max_positions=rot_cfg.get("max_positions", 8),
                 rebalance_frequency=rot_cfg.get("rebalance_frequency", "weekly"),
                 weekly_rebalance_day=rot_cfg.get("weekly_rebalance_day", "monday"),
                 lookback_short=rot_cfg.get("lookback_short", 63),
@@ -97,15 +98,15 @@ class TradebotUTIL:
                 lookback_long=rot_cfg.get("lookback_long", 252),
                 trend_ema=rot_cfg.get("trend_ema", 50),
                 vol_lookback=rot_cfg.get("vol_lookback", 63),
-                min_score=rot_cfg.get("min_score", 0.0),
-                exit_score=rot_cfg.get("exit_score", -0.25),
+                min_score=rot_cfg.get("min_score", -0.10),
+                exit_score=rot_cfg.get("exit_score", -0.75),
                 hard_stop_pct=rot_cfg.get("hard_stop_pct", t_cfg["stop_loss_pct"]),
                 max_position_pct=rot_cfg.get("max_position_pct", t_cfg["max_position_pct"]),
-                w_mom_short=rot_w.get("momentum_3m", 0.30),
-                w_mom_mid=rot_w.get("momentum_6m", 0.30),
+                w_mom_short=rot_w.get("momentum_3m", 0.25),
+                w_mom_mid=rot_w.get("momentum_6m", 0.35),
                 w_mom_long=rot_w.get("momentum_12m", 0.20),
                 w_trend=rot_w.get("trend", 0.20),
-                w_low_vol=rot_w.get("low_volatility", 0.15),
+                w_low_vol=rot_w.get("low_volatility", 0.10),
             ),
             "rebalance_anticipation": RebalanceAnticipationStrategy(
                 days_before=s_cfg["rebalance_anticipation"]["days_before_rebalance"],
@@ -120,7 +121,6 @@ class TradebotUTIL:
         self._running = False
 
     def start(self) -> None:
-        """Inicia o bot."""
         if self.mode in ("live", "paper"):
             if not self.mt5.connect():
                 logger.error("Falha ao conectar ao MT5. Abortando.")
@@ -152,7 +152,6 @@ class TradebotUTIL:
         logger.info("Agendamento configurado: ciclo diário 10:05, resumo 17:15.")
 
     def _load_ohlcv_all(self, timeframe: str = "D1", n_bars: int = 320) -> dict:
-        """Carrega OHLCV de todos os ativos do universo UTIL."""
         ohlcv_dict = {}
         for ticker in self.universe:
             df = self.mt5.get_ohlcv(ticker, timeframe, n_bars=n_bars)
@@ -162,7 +161,6 @@ class TradebotUTIL:
         return ohlcv_dict
 
     def _get_open_positions(self) -> dict[str, dict]:
-        """Lê posições abertas do bot em paper ou live."""
         if self.mode == "paper":
             return self.executor.get_open_paper_positions()
 
@@ -188,7 +186,6 @@ class TradebotUTIL:
         return out
 
     def _update_macro(self) -> None:
-        """Atualiza dados macroeconômicos usados pela estratégia legada."""
         selic = self.macro.get_selic_rate()
         focus = self.macro.get_di_futures()
         if selic:
@@ -198,7 +195,6 @@ class TradebotUTIL:
             logger.info("Macro atualizado | Selic={:.2f}% | Regime={}", selic * 100, regime)
 
     def _run_daily_cycle(self) -> None:
-        """Ciclo diário: ranking UTIL, substituição Top 4 e estratégias opcionais."""
         if not self.risk.is_trading_allowed():
             return
 
@@ -230,7 +226,7 @@ class TradebotUTIL:
             force_rebalance=False,
         )
 
-        logger.info("[Top4Rotation] Ranking:")
+        logger.info("[BestAssetsRotation] Ranking:")
         for item in plan.scores[:10]:
             logger.info(
                 "  {} | score={:.3f} | elegivel={} | motivo={} | m3={:.1%} m6={:.1%} m12={:.1%} vol={:.1%}",
@@ -252,7 +248,6 @@ class TradebotUTIL:
             self._process_signal(signal, "top4_rotation")
 
     def _process_signal(self, signal, strategy_name: str) -> None:
-        """Calcula position size e envia ordem."""
         weight = self.strategy_weights.get(strategy_name, 0.0)
         if weight <= 0:
             logger.warning("Estratégia {} com peso zero. Sinal ignorado.", strategy_name)
@@ -281,7 +276,6 @@ class TradebotUTIL:
             self.risk.register_open_position(signal.ticker, pos_size.capital_allocated)
 
     def _print_summary(self) -> None:
-        """Imprime resumo do portfólio."""
         summary = self.risk.portfolio_summary()
         account = self.mt5.get_account_info() if self.mode == "live" else {}
 
