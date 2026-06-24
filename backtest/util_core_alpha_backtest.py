@@ -1,17 +1,24 @@
 """
-Backtest UTIL Core + Alpha — Tradebot-UTIL.v2 / branch infra-1
+Backtest UTIL Hybrid System — Tradebot-UTIL.v2 / branch infra-1
 ───────────────────────────────────────────────────────────────
 
-Estratégia:
-    Benchmark + Tilt. A carteira começa replicando o UTIL sintético fiel aos
-    18 ativos e depois aplica um tilt ativo: tira peso dos piores rankings e
-    transfere para os melhores. Assim ela não fica subexposta em ciclos fortes
-    do índice, que foi o problema da versão anterior.
+Sistema híbrido inspirado no documento técnico do Tradebot-UTIL:
 
-Ideia prática:
-    - Bull: 100% exposto ao UTIL + tilt ativo de 20%.
-    - Neutro: 95% exposto ao UTIL + tilt ativo de 15%.
-    - Defensivo: 70% exposto ao UTIL + tilt ativo de 10%.
+1) Core book
+   Replica parcialmente a estrutura do UTIL, mas foca nas maiores posições do
+   índice para não se descolar demais do benchmark.
+
+2) Alpha 1 — Mean Reversion
+   Opera apenas quando existe vantagem estatística clara: fechamento abaixo da
+   banda inferior, RSI baixo, z-score negativo e filtro de tendência/macro não
+   deteriorado.
+
+3) Alpha 2 — Momentum Macro
+   Entra nos top 3-5 nomes quando o regime do setor está favorável.
+
+4) Eventos / Pair trading
+   Nesta versão ficam como módulos leves/defensivos: o backtest reserva a
+   estrutura, mas não faz short nem usa dados externos de ANEEL/Copom/DI.
 
 Uso:
     python backtest/util_core_alpha_backtest.py --start 2025-06-23 --end 2026-06-23
@@ -37,6 +44,10 @@ except ImportError as exc:  # pragma: no cover
 
 from backtest.backtest_engine import UTIL_UNIVERSE, synthetic_util_benchmark
 
+
+CORE_TICKERS = ["SBSP3", "AXIA3", "EQTL3", "ENEV3", "CPLE3"]
+MEAN_REVERSION_TICKERS = ["SBSP3", "EQTL3", "CPLE3", "EGIE3", "TAEE11", "CMIG4", "CSMG3", "SAPR11"]
+MOMENTUM_TICKERS = ["SBSP3", "AXIA3", "EQTL3", "ENEV3", "CPLE3", "CMIG4", "ENGI11", "EGIE3"]
 
 LIQUIDITY_TIER = {
     "SBSP3": 1, "AXIA3": 1, "EQTL3": 1, "ENEV3": 1, "CPLE3": 1, "CMIG4": 1,
@@ -96,10 +107,12 @@ def aligned_field(data: dict[str, pd.DataFrame], field: str) -> pd.DataFrame:
     return frame.ffill().dropna(how="all")
 
 
-def util_core_weights(columns: pd.Index) -> pd.Series:
-    weights = pd.Series({ticker: UTIL_UNIVERSE[ticker] for ticker in columns if ticker in UTIL_UNIVERSE}, dtype=float)
-    weights = weights / weights.sum()
-    return weights.reindex(columns).fillna(0.0)
+def rsi(close: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+    loss = (-delta.clip(upper=0)).rolling(window, min_periods=window).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
 def cs_rank(frame: pd.DataFrame, higher_is_better: bool = True) -> pd.DataFrame:
@@ -109,34 +122,13 @@ def cs_rank(frame: pd.DataFrame, higher_is_better: bool = True) -> pd.DataFrame:
     return ((ranked - 0.5) * 2.0).fillna(0.0)
 
 
-def compute_alpha_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Series) -> pd.DataFrame:
-    bench = benchmark.reindex(closes.index).ffill()
-    rel_1m = closes.pct_change(21).sub(bench.pct_change(21), axis=0)
-    rel_3m = closes.pct_change(63).sub(bench.pct_change(63), axis=0)
-    rel_6m = closes.pct_change(126).sub(bench.pct_change(126), axis=0)
-    rel_12m = closes.pct_change(252).sub(bench.pct_change(252), axis=0)
-
-    ema50 = closes.ewm(span=50, adjust=False, min_periods=30).mean()
-    ema200 = closes.ewm(span=200, adjust=False, min_periods=60).mean()
-    trend = (closes / ema200 - 1.0).clip(-0.30, 0.30)
-    trend_short = (closes / ema50 - 1.0).clip(-0.20, 0.20)
-    vol = closes.pct_change().rolling(63, min_periods=35).std() * math.sqrt(252)
-    traded_value = np.log((closes * volumes).rolling(20, min_periods=10).mean().replace(0, np.nan))
-
-    tier_bonus = pd.Series({t: {1: 0.04, 2: 0.00, 3: -0.04}.get(LIQUIDITY_TIER.get(t, 2), 0.0) for t in closes.columns})
-    score = (
-        0.14 * cs_rank(rel_1m)
-        + 0.28 * cs_rank(rel_3m)
-        + 0.22 * cs_rank(rel_6m)
-        + 0.06 * cs_rank(rel_12m)
-        + 0.12 * cs_rank(trend)
-        + 0.08 * cs_rank(trend_short)
-        + 0.04 * cs_rank(traded_value)
-        + 0.06 * cs_rank(vol, higher_is_better=False)
-    )
-    score = score.add(tier_bonus, axis=1)
-    score = score.where((closes >= ema200) | ema200.isna(), score - 0.06)
-    return score.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+def util_weights(columns: pd.Index, subset: list[str] | None = None) -> pd.Series:
+    names = [t for t in columns if t in UTIL_UNIVERSE and (subset is None or t in subset)]
+    w = pd.Series({t: UTIL_UNIVERSE[t] for t in names}, dtype=float)
+    if w.empty:
+        return pd.Series(0.0, index=columns)
+    w = w / w.sum()
+    return w.reindex(columns).fillna(0.0)
 
 
 def market_regime(date: pd.Timestamp, benchmark: pd.Series) -> str:
@@ -153,80 +145,171 @@ def market_regime(date: pd.Timestamp, benchmark: pd.Series) -> str:
         return "bull"
     if now > ma160 and dd > -0.10:
         return "neutral"
-    return "defensive"
+    return "adverse"
 
 
-def regime_params(regime: str, args: argparse.Namespace) -> tuple[float, float]:
-    if regime == "bull":
-        return args.exposure_bull, args.tilt_bull
-    if regime == "neutral":
-        return args.exposure_neutral, args.tilt_neutral
-    if regime == "defensive":
-        return args.exposure_defensive, args.tilt_defensive
-    return 0.0, 0.0
+def compute_indicators(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Series) -> dict[str, pd.DataFrame]:
+    ma20 = closes.rolling(20, min_periods=15).mean()
+    sd20 = closes.rolling(20, min_periods=15).std().replace(0, np.nan)
+    z20 = (closes - ma20) / sd20
+    rsi14 = rsi(closes, 14)
+    ema50 = closes.ewm(span=50, adjust=False, min_periods=30).mean()
+    ema200 = closes.ewm(span=200, adjust=False, min_periods=60).mean()
+
+    bench = benchmark.reindex(closes.index).ffill()
+    rel_1m = closes.pct_change(21).sub(bench.pct_change(21), axis=0)
+    rel_3m = closes.pct_change(63).sub(bench.pct_change(63), axis=0)
+    rel_6m = closes.pct_change(126).sub(bench.pct_change(126), axis=0)
+    vol = closes.pct_change().rolling(63, min_periods=35).std() * math.sqrt(252)
+    traded_value = np.log((closes * volumes).rolling(20, min_periods=10).mean().replace(0, np.nan))
+
+    tier_bonus = pd.Series({t: {1: 0.04, 2: 0.00, 3: -0.04}.get(LIQUIDITY_TIER.get(t, 2), 0.0) for t in closes.columns})
+    momentum_score = (
+        0.28 * cs_rank(rel_1m)
+        + 0.34 * cs_rank(rel_3m)
+        + 0.18 * cs_rank(rel_6m)
+        + 0.10 * cs_rank(closes / ema50 - 1.0)
+        + 0.05 * cs_rank(traded_value)
+        + 0.05 * cs_rank(vol, higher_is_better=False)
+    ).add(tier_bonus, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    mr_edge = (
+        0.48 * cs_rank(-z20)
+        + 0.32 * cs_rank(30 - rsi14)
+        + 0.12 * cs_rank(traded_value)
+        + 0.08 * cs_rank(vol, higher_is_better=False)
+    ).add(tier_bonus, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return {
+        "z20": z20,
+        "rsi14": rsi14,
+        "ema50": ema50,
+        "ema200": ema200,
+        "momentum_score": momentum_score,
+        "mr_edge": mr_edge,
+    }
 
 
-def apply_active_tilt(base: pd.Series, score_row: pd.Series, tilt: float, top_n: int, bottom_n: int, max_asset: float) -> pd.Series:
-    """Aplica tilt zero-sum: aumenta top rankings e reduz bottom rankings.
-
-    A soma da carteira permanece igual à exposição base. Isso evita que o bot
-    perca para o benchmark só por ficar subexposto em mercado forte.
-    """
-    if tilt <= 0 or base.sum() <= 0:
-        return base.copy()
-
-    scores = score_row.reindex(base.index).fillna(0.0)
-    top = scores.sort_values(ascending=False).head(max(1, top_n)).index
-    bottom = scores.sort_values(ascending=True).head(max(1, bottom_n)).index
-
-    target = base.copy()
-    removable = target.loc[bottom].clip(lower=0)
-    remove_total = min(float(tilt), float(removable.sum()))
-    if remove_total <= 1e-12:
-        return target
-
-    # Remove dos piores proporcionalmente ao peso que eles já têm.
-    remove = removable / removable.sum() * remove_total
-    target.loc[remove.index] -= remove
-
-    # Adiciona nos melhores proporcionalmente ao score positivo e respeitando teto por ativo.
-    top_scores = scores.loc[top]
-    top_scores = top_scores - top_scores.min() + 0.25
-    add = top_scores / top_scores.sum() * remove_total
-    target.loc[top] += add
-
-    # Se algum ativo estourou teto, corta e redistribui para outros top/core.
+def cap_and_redistribute(weights: pd.Series, max_asset: float, target_sum: float | None = None) -> pd.Series:
+    w = weights.clip(lower=0.0, upper=max_asset)
+    target = float(w.sum() if target_sum is None else target_sum)
     for _ in range(10):
-        excess = (target - max_asset).clip(lower=0)
-        excess_total = float(excess.sum())
-        if excess_total <= 1e-10:
+        spare = target - float(w.sum())
+        if spare <= 1e-10:
             break
-        target = target.clip(upper=max_asset)
-        room = (max_asset - target).clip(lower=0)
-        # Prioriza top; se não houver espaço, usa todos os ativos com espaço.
-        preferred = room.loc[top]
-        if preferred.sum() > 1e-10:
-            alloc_room = preferred
-        else:
-            alloc_room = room[room > 1e-10]
-        if alloc_room.empty or alloc_room.sum() <= 1e-10:
+        room = (max_asset - w).clip(lower=0.0)
+        if room.sum() <= 1e-10:
             break
-        target.loc[alloc_room.index] += (alloc_room / alloc_room.sum() * excess_total).clip(upper=alloc_room)
+        w += (room / room.sum() * spare).clip(upper=room)
+    return w.clip(lower=0.0, upper=max_asset)
 
-    return target.clip(lower=0)
+
+def core_book(columns: pd.Index, exposure: float, max_asset: float) -> pd.Series:
+    base = util_weights(columns, CORE_TICKERS) * exposure
+    return cap_and_redistribute(base, max_asset, exposure)
 
 
-def target_weights_for_date(date: pd.Timestamp, closes: pd.DataFrame, benchmark: pd.Series, scores: pd.DataFrame, args: argparse.Namespace) -> pd.Series:
-    exposure, tilt = regime_params(market_regime(date, benchmark), args)
-    core = util_core_weights(closes.columns) * exposure
-    target = apply_active_tilt(core, scores.loc[date], tilt, args.top_n, args.bottom_n, args.max_asset)
-    # Pequeno ajuste final para preservar a exposição pretendida quando possível.
-    diff = exposure - target.sum()
-    if diff > 1e-8:
-        room = (args.max_asset - target).clip(lower=0)
-        if room.sum() > 1e-8:
-            target += (room / room.sum() * diff).clip(upper=room)
-    return target.reindex(closes.columns).fillna(0.0)
+def mean_reversion_book(date: pd.Timestamp, closes: pd.DataFrame, indicators: dict[str, pd.DataFrame], regime: str, exposure: float, max_asset: float) -> pd.Series:
+    cols = closes.columns
+    out = pd.Series(0.0, index=cols)
+    if exposure <= 0 or regime == "adverse":
+        return out
+
+    z = indicators["z20"].loc[date]
+    r = indicators["rsi14"].loc[date]
+    ema200 = indicators["ema200"].loc[date]
+    edge = indicators["mr_edge"].loc[date]
+    price = closes.loc[date]
+
+    eligible = []
+    for ticker in MEAN_REVERSION_TICKERS:
+        if ticker not in cols:
+            continue
+        trend_ok = pd.isna(ema200.get(ticker, np.nan)) or price[ticker] >= ema200[ticker] * 0.97
+        signal_ok = (z[ticker] <= -1.15 and r[ticker] <= 40) or (z[ticker] <= -1.65 and r[ticker] <= 48)
+        if trend_ok and signal_ok:
+            eligible.append(ticker)
+
+    if not eligible:
+        return out
+    selected = edge.loc[eligible].sort_values(ascending=False).head(4)
+    shifted = selected - selected.min() + 0.25
+    w = shifted / shifted.sum() * exposure
+    out.loc[w.index] = w
+    return cap_and_redistribute(out, max_asset, min(exposure, out.sum()))
+
+
+def momentum_book(date: pd.Timestamp, closes: pd.DataFrame, indicators: dict[str, pd.DataFrame], regime: str, exposure: float, max_asset: float, top_n: int) -> pd.Series:
+    cols = closes.columns
+    out = pd.Series(0.0, index=cols)
+    if exposure <= 0 or regime != "bull":
+        return out
+
+    score = indicators["momentum_score"].loc[date]
+    ema50 = indicators["ema50"].loc[date]
+    price = closes.loc[date]
+    universe = [t for t in MOMENTUM_TICKERS if t in cols and (pd.isna(ema50[t]) or price[t] >= ema50[t])]
+    if not universe:
+        return out
+    selected = score.loc[universe].sort_values(ascending=False).head(top_n)
+    shifted = selected - selected.min() + 0.25
+    w = shifted / shifted.sum() * exposure
+    out.loc[w.index] = w
+    return cap_and_redistribute(out, max_asset, min(exposure, out.sum()))
+
+
+def pair_tilt_book(date: pd.Timestamp, closes: pd.DataFrame, exposure: float) -> pd.Series:
+    """Long-only pair tilt simples.
+
+    Não faz short. Apenas desloca pequeno peso para o lado relativamente barato
+    quando o spread entre pares está esticado. Módulo conservador.
+    """
+    out = pd.Series(0.0, index=closes.columns)
+    if exposure <= 0 or len(closes.loc[:date]) < 80:
+        return out
+    pairs = [("EQTL3", "TAEE11"), ("SBSP3", "ENEV3"), ("CPLE3", "CMIG4")]
+    chosen = []
+    for a, b in pairs:
+        if a not in closes.columns or b not in closes.columns:
+            continue
+        hist = np.log(closes[[a, b]].loc[:date]).dropna().tail(120)
+        if len(hist) < 60:
+            continue
+        spread = hist[a] - hist[b]
+        z = (spread.iloc[-1] - spread.mean()) / (spread.std() if spread.std() else np.nan)
+        if pd.isna(z):
+            continue
+        if z > 1.5:
+            chosen.append(b)
+        elif z < -1.5:
+            chosen.append(a)
+    if chosen:
+        out.loc[chosen] = exposure / len(chosen)
+    return out
+
+
+def target_weights_for_date(date: pd.Timestamp, closes: pd.DataFrame, benchmark: pd.Series, indicators: dict[str, pd.DataFrame], args: argparse.Namespace) -> pd.Series:
+    regime = market_regime(date, benchmark)
+
+    if regime == "bull":
+        core_exp, mr_exp, mom_exp, pair_exp = args.core_bull, args.mr_bull, args.momentum_bull, args.pair_bull
+    elif regime == "neutral":
+        core_exp, mr_exp, mom_exp, pair_exp = args.core_neutral, args.mr_neutral, args.momentum_neutral, args.pair_neutral
+    elif regime == "adverse":
+        core_exp, mr_exp, mom_exp, pair_exp = args.core_adverse, args.mr_adverse, args.momentum_adverse, args.pair_adverse
+    else:
+        return pd.Series(0.0, index=closes.columns)
+
+    core = core_book(closes.columns, core_exp, args.max_asset)
+    mr = mean_reversion_book(date, closes, indicators, regime, mr_exp, args.max_asset)
+    mom = momentum_book(date, closes, indicators, regime, mom_exp, args.max_asset, args.top_n)
+    pair = pair_tilt_book(date, closes, pair_exp)
+
+    target = core + mr + mom + pair
+    max_exposure = min(args.max_exposure, core_exp + mr_exp + mom_exp + pair_exp)
+    if target.sum() > max_exposure:
+        target *= max_exposure / target.sum()
+    return cap_and_redistribute(target, args.max_asset, min(max_exposure, target.sum()))
 
 
 def run_backtest(data: dict[str, pd.DataFrame], closes: pd.DataFrame, volumes: pd.DataFrame, capital: float, args: argparse.Namespace) -> tuple[pd.Series, pd.Series, pd.DataFrame, float]:
@@ -234,18 +317,23 @@ def run_backtest(data: dict[str, pd.DataFrame], closes: pd.DataFrame, volumes: p
     closes = closes.reindex(benchmark.index).ffill().dropna(how="all")
     volumes = volumes.reindex(closes.index).ffill().fillna(0.0)
     benchmark = benchmark.reindex(closes.index).ffill().dropna()
-    scores = compute_alpha_scores(closes, volumes, benchmark)
+    indicators = compute_indicators(closes, volumes, benchmark)
+
     daily_returns = closes.pct_change().fillna(0.0)
     rebalance_dates = closes.resample(args.rebalance).last().index
     rebalance_dates = closes.index.intersection(rebalance_dates)
+    # Também permite entradas semanais de mean reversion sem girar demais o core.
+    signal_dates = closes.resample(args.signal_frequency).last().index
+    rebalance_dates = closes.index.intersection(rebalance_dates.union(signal_dates))
 
     weights = pd.DataFrame(0.0, index=closes.index, columns=closes.columns)
     current = pd.Series(0.0, index=closes.columns)
     turnover = 0.0
     cost_rate = (args.fee_bps + args.slippage_bps) / 10_000
+
     for dt in closes.index:
         if dt in rebalance_dates:
-            target = target_weights_for_date(dt, closes, benchmark, scores, args)
+            target = target_weights_for_date(dt, closes, benchmark, indicators, args)
             turnover += float((target - current).abs().sum())
             current = target
         weights.loc[dt] = current
@@ -254,6 +342,7 @@ def run_backtest(data: dict[str, pd.DataFrame], closes: pd.DataFrame, volumes: p
     strategy_returns = (shifted * daily_returns).sum(axis=1)
     daily_turnover = shifted.diff().abs().sum(axis=1).fillna(0.0)
     strategy_returns = strategy_returns - daily_turnover * cost_rate
+
     equity = (1.0 + strategy_returns).cumprod() * capital
     bench_equity = (benchmark / benchmark.iloc[0]) * capital
     bench_equity = bench_equity.reindex(equity.index).ffill()
@@ -305,8 +394,8 @@ def summarize(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame, tu
 def save_outputs(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame, output_dir: Path, csv: bool, plot: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if csv:
-        pd.DataFrame({"strategy": equity, "benchmark_util": benchmark}).to_csv(output_dir / "util_core_alpha_equity.csv")
-        weights.to_csv(output_dir / "util_core_alpha_weights.csv")
+        pd.DataFrame({"strategy": equity, "benchmark_util": benchmark}).to_csv(output_dir / "util_hybrid_equity.csv")
+        weights.to_csv(output_dir / "util_hybrid_weights.csv")
         print(f"CSV salvo em: {output_dir}")
     if plot:
         try:
@@ -314,14 +403,14 @@ def save_outputs(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame,
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(13, 7))
-            ax.plot(equity.index, equity.values, label="UTIL Core + Alpha")
+            ax.plot(equity.index, equity.values, label="UTIL Hybrid System")
             ax.plot(benchmark.index, benchmark.values, label="Benchmark UTIL", linestyle="--")
-            ax.set_title("Tradebot-UTIL.v2 — UTIL Core + Alpha vs Benchmark")
+            ax.set_title("Tradebot-UTIL.v2 — UTIL Hybrid System vs Benchmark")
             ax.set_ylabel("Patrimônio (R$)")
             ax.grid(True, alpha=0.3)
             ax.legend()
             fig.tight_layout()
-            path = output_dir / "util_core_alpha_backtest.png"
+            path = output_dir / "util_hybrid_backtest.png"
             fig.savefig(path, dpi=150)
             print(f"Gráfico salvo em: {path}")
         except Exception as exc:
@@ -329,20 +418,31 @@ def save_outputs(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest UTIL Core + Alpha — benchmark plus tilt")
+    parser = argparse.ArgumentParser(description="Backtest UTIL Hybrid System")
     parser.add_argument("--start", default="2019-01-01")
     parser.add_argument("--end", default="2026-01-01")
     parser.add_argument("--capital", type=float, default=100_000.0)
-    parser.add_argument("--rebalance", default="M", help="Frequência pandas: M, W-FRI, 2W-FRI")
-    parser.add_argument("--top-n", type=int, default=5)
-    parser.add_argument("--bottom-n", type=int, default=5)
-    parser.add_argument("--exposure-bull", type=float, default=1.00)
-    parser.add_argument("--tilt-bull", type=float, default=0.20)
-    parser.add_argument("--exposure-neutral", type=float, default=0.95)
-    parser.add_argument("--tilt-neutral", type=float, default=0.15)
-    parser.add_argument("--exposure-defensive", type=float, default=0.70)
-    parser.add_argument("--tilt-defensive", type=float, default=0.10)
-    parser.add_argument("--max-asset", type=float, default=0.25)
+    parser.add_argument("--rebalance", default="M", help="Rebalanceamento do core/momentum: M, W-FRI, 2W-FRI")
+    parser.add_argument("--signal-frequency", default="W-FRI", help="Frequência de checagem dos sinais táticos")
+    parser.add_argument("--top-n", type=int, default=4)
+    parser.add_argument("--max-asset", type=float, default=0.19)
+    parser.add_argument("--max-exposure", type=float, default=1.00)
+
+    parser.add_argument("--core-bull", type=float, default=0.60)
+    parser.add_argument("--mr-bull", type=float, default=0.25)
+    parser.add_argument("--momentum-bull", type=float, default=0.10)
+    parser.add_argument("--pair-bull", type=float, default=0.05)
+
+    parser.add_argument("--core-neutral", type=float, default=0.55)
+    parser.add_argument("--mr-neutral", type=float, default=0.25)
+    parser.add_argument("--momentum-neutral", type=float, default=0.05)
+    parser.add_argument("--pair-neutral", type=float, default=0.05)
+
+    parser.add_argument("--core-adverse", type=float, default=0.35)
+    parser.add_argument("--mr-adverse", type=float, default=0.00)
+    parser.add_argument("--momentum-adverse", type=float, default=0.00)
+    parser.add_argument("--pair-adverse", type=float, default=0.05)
+
     parser.add_argument("--fee-bps", type=float, default=3.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--csv", action="store_true")
@@ -352,15 +452,11 @@ def main() -> None:
 
     tickers = list(UTIL_UNIVERSE.keys())
     if not args.quiet:
-        print("Tradebot-UTIL.v2 — Backtest UTIL Core + Alpha")
+        print("Tradebot-UTIL.v2 — Backtest UTIL Hybrid System")
         print(f"Universo UTIL elegível: {len(tickers)} ativos")
         print("Ativos:", ", ".join(tickers))
         print(f"Período: {args.start} → {args.end} | Capital: R$ {args.capital:,.2f}")
-        print(
-            f"Regimes: bull exposição/tilt={args.exposure_bull:.0%}/{args.tilt_bull:.0%}, "
-            f"neutral={args.exposure_neutral:.0%}/{args.tilt_neutral:.0%}, "
-            f"defensive={args.exposure_defensive:.0%}/{args.tilt_defensive:.0%}"
-        )
+        print("Alocação bull: core {:.0%}, mean reversion {:.0%}, momentum {:.0%}, pairs/eventos {:.0%}".format(args.core_bull, args.mr_bull, args.momentum_bull, args.pair_bull))
 
     data = download_ohlcv(tickers, args.start, args.end, verbose=not args.quiet)
     if len(data) < 5:
@@ -370,7 +466,7 @@ def main() -> None:
     equity, benchmark, weights, turnover = run_backtest(data, closes, volumes, args.capital, args)
     stats = summarize(equity, benchmark, weights, turnover)
 
-    print("\nResumo — UTIL Core + Alpha")
+    print("\nResumo — UTIL Hybrid System")
     print("─" * 55)
     print(f"Retorno estratégia : {stats.strategy_return_pct:+.2f}%")
     print(f"Retorno benchmark  : {stats.benchmark_return_pct:+.2f}%")
