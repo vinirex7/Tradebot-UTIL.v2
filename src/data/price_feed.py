@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import time
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -53,17 +52,73 @@ class PriceFeed:
 
     def __init__(self, config: dict):
         cfg = config.get("data", {})
-        self.history_days: int    = int(cfg.get("price_history_days", 300))
-        self.adjusted: bool       = bool(cfg.get("adjusted_prices", True))
-        self.suffix: str          = str(cfg.get("yfinance_suffix", ".SA"))
-        self.universe: list[str]  = list(UTIL_UNIVERSE.keys())
+        self.mt5_cfg: dict       = config.get("mt5", {})
+        self.history_days: int   = int(cfg.get("price_history_days", 300))
+        self.adjusted: bool      = bool(cfg.get("adjusted_prices", True))
+        self.suffix: str         = str(cfg.get("yfinance_suffix", ".SA"))
+        self.universe: list[str] = list(UTIL_UNIVERSE.keys())
 
         # Cache em memória: ticker → (timestamp, DataFrame)
         self._cache: dict[str, tuple[float, pd.DataFrame]] = {}
         self._benchmark_cache: Optional[tuple[float, pd.Series]] = None
+        self._mt5_initialized: bool = False
 
         logger.info("PriceFeed inicializado | {} ativos | {} dias de histórico",
                     len(self.universe), self.history_days)
+
+    # ─── Sessão MT5 ──────────────────────────────────────────────────────────
+
+    def _ensure_mt5_session(self) -> bool:
+        """
+        Garante que o módulo MetaTrader5 esteja ligado ao terminal.
+
+        Quando mt5.use_existing_session=true, usa initialize() sem credenciais para
+        reaproveitar o MT5 já aberto/logado. Se mt5.path estiver preenchido, aponta
+        para o executável correto caso o terminal ainda não esteja aberto.
+        """
+        if not _MT5_AVAILABLE:
+            return False
+
+        try:
+            import MetaTrader5 as mt5  # noqa
+
+            if self._mt5_initialized and mt5.terminal_info() is not None:
+                return True
+
+            # Se outra parte do bot já inicializou o MT5, apenas reaproveita.
+            if mt5.terminal_info() is not None:
+                self._mt5_initialized = True
+                return True
+
+            timeout = int(self.mt5_cfg.get("timeout", 60000))
+            path = str(self.mt5_cfg.get("path", "") or "").strip()
+            use_existing = bool(self.mt5_cfg.get("use_existing_session", True))
+
+            if use_existing:
+                kwargs = {"timeout": timeout}
+                if path:
+                    kwargs["path"] = path
+                ok = mt5.initialize(**kwargs)
+            else:
+                kwargs = {
+                    "login": int(self.mt5_cfg.get("login", 0)),
+                    "password": str(self.mt5_cfg.get("password", "")),
+                    "server": str(self.mt5_cfg.get("server", "")),
+                    "timeout": timeout,
+                }
+                if path:
+                    kwargs["path"] = path
+                ok = mt5.initialize(**kwargs)
+
+            if not ok:
+                logger.debug("MT5 não inicializado no PriceFeed: {}", mt5.last_error())
+                return False
+
+            self._mt5_initialized = True
+            return True
+        except Exception as exc:
+            logger.debug("Erro ao garantir sessão MT5 no PriceFeed: {}", exc)
+            return False
 
     # ─── Download principal ────────────────────────────────────────────────
 
@@ -144,12 +199,13 @@ class PriceFeed:
     def _download_mt5(
         self, ticker: str, start: str, end: str
     ) -> Optional[pd.DataFrame]:
-        """Baixa dados via MT5 (apenas se conectado)."""
-        if not _MT5_AVAILABLE:
+        """Baixa dados via MT5 usando a sessão existente quando disponível."""
+        if not self._ensure_mt5_session():
             return None
         try:
             import MetaTrader5 as mt5  # noqa
             symbol = ticker  # MT5 usa ticker sem sufixo para B3
+            mt5.symbol_select(symbol, True)
             rates = mt5.copy_rates_range(
                 symbol,
                 mt5.TIMEFRAME_D1,
@@ -193,14 +249,20 @@ class PriceFeed:
         return prices
 
     def _mt5_last_price(self, ticker: str) -> Optional[float]:
-        if not _MT5_AVAILABLE:
+        """Retorna último preço via MT5 reaproveitando a sessão existente."""
+        if not self._ensure_mt5_session():
             return None
         try:
             import MetaTrader5 as mt5  # noqa
+            mt5.symbol_select(ticker, True)
             tick = mt5.symbol_info_tick(ticker)
             if tick is None:
                 return None
-            return float(tick.last) if tick.last > 0 else float(tick.ask)
+            candidates = (tick.last, tick.ask, tick.bid)
+            for value in candidates:
+                if value and value > 0:
+                    return float(value)
+            return None
         except Exception:
             return None
 
