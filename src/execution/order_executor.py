@@ -20,7 +20,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 from loguru import logger
 
@@ -90,13 +89,13 @@ class OrderExecutor:
         trading_cfg = config.get("trading", {})
         exec_cfg = config.get("execution", {})
 
-        self.mode: str         = trading_cfg.get("mode", "paper")
-        self.capital: float    = float(trading_cfg.get("capital", 100_000.0))
-        self.fee_bps: float    = float(exec_cfg.get("fee_bps", 3.0))
+        self.mode: str = trading_cfg.get("mode", "paper")
+        self.capital: float = float(trading_cfg.get("capital", 100_000.0))
+        self.fee_bps: float = float(exec_cfg.get("fee_bps", 3.0))
         self.slippage_bps: float = float(exec_cfg.get("slippage_bps", 5.0))
         self.min_order_value: float = float(exec_cfg.get("min_order_value", 100.0))
-        self.lot_size: int     = int(exec_cfg.get("lot_size", self.LOT_SIZE))
-        self.order_type: str   = exec_cfg.get("order_type", "market")
+        self.lot_size: int = int(exec_cfg.get("lot_size", self.LOT_SIZE))
+        self.order_type: str = exec_cfg.get("order_type", "market")
         self.limit_offset_bps: float = float(exec_cfg.get("limit_offset_bps", 5.0))
 
         self._mt5_ready: bool = False
@@ -109,30 +108,95 @@ class OrderExecutor:
         )
 
     def _init_mt5(self, mt5_cfg: dict) -> None:
+        """
+        Inicializa o MT5 sem alterar a lógica do bot.
+
+        Fluxo preferencial:
+          1. Se mt5.use_existing_session=true, chama mt5.initialize() sem login/senha
+             para reaproveitar o MT5 já aberto e logado no computador.
+          2. Se mt5.path estiver definido, usa esse executável quando o terminal não
+             estiver aberto ou quando houver múltiplas instalações.
+          3. Só usa login/password/server quando use_existing_session=false ou como
+             fallback explícito se houver credenciais preenchidas.
+        """
         if not _MT5_AVAILABLE:
             logger.error("MetaTrader5 não instalado — modo live impossível")
             return
+
         try:
             import MetaTrader5 as mt5  # noqa
-            ok = mt5.initialize(
-                login=int(mt5_cfg.get("login", 0)),
-                password=str(mt5_cfg.get("password", "")),
-                server=str(mt5_cfg.get("server", "")),
-                timeout=int(mt5_cfg.get("timeout", 60000)),
-            )
-            if ok:
-                info = mt5.account_info()
-                self._mt5_ready = True
-                self.capital = float(info.balance) if info else self.capital
-                logger.info(
-                    "MT5 conectado | servidor={} | saldo=R${:,.2f}",
-                    mt5_cfg.get("server"), self.capital
+
+            timeout = int(mt5_cfg.get("timeout", 60000))
+            path = str(mt5_cfg.get("path", "") or "").strip()
+            use_existing = bool(mt5_cfg.get("use_existing_session", True))
+
+            if use_existing and self._initialize_existing_mt5_session(mt5, path, timeout):
+                return
+
+            login = int(mt5_cfg.get("login", 0) or 0)
+            password = str(mt5_cfg.get("password", "") or "")
+            server = str(mt5_cfg.get("server", "") or "")
+
+            if not (login and password and server):
+                logger.error(
+                    "MT5 não conectado. Abra o MetaTrader 5 e faça login, "
+                    "ou preencha mt5.path/login/password/server no config."
                 )
+                return
+
+            kwargs = {
+                "login": login,
+                "password": password,
+                "server": server,
+                "timeout": timeout,
+            }
+            if path:
+                kwargs["path"] = path
+
+            ok = mt5.initialize(**kwargs)
+            if ok:
+                self._set_mt5_ready(mt5, server_label=server)
             else:
-                err = mt5.last_error()
-                logger.error("Falha ao conectar MT5: {}", err)
+                logger.error("Falha ao conectar MT5 com credenciais: {}", mt5.last_error())
         except Exception as exc:
             logger.error("Erro ao inicializar MT5: {}", exc)
+
+    def _initialize_existing_mt5_session(self, mt5_module, path: str, timeout: int) -> bool:
+        """Usa a sessão já aberta/logada do MT5, sem enviar credenciais."""
+        kwargs = {"timeout": timeout}
+        if path:
+            kwargs["path"] = path
+
+        ok = mt5_module.initialize(**kwargs)
+        if not ok:
+            logger.warning("MT5 initialize() sem credenciais falhou: {}", mt5_module.last_error())
+            return False
+
+        info = mt5_module.account_info()
+        if info is None:
+            logger.error(
+                "MT5 inicializado, mas nenhuma conta está logada. "
+                "Abra o MT5, faça login na XP e rode o bot novamente."
+            )
+            mt5_module.shutdown()
+            return False
+
+        self._set_mt5_ready(mt5_module, server_label=getattr(info, "server", "sessão existente"))
+        return True
+
+    def _set_mt5_ready(self, mt5_module, server_label: str) -> None:
+        info = mt5_module.account_info()
+        if info is None:
+            logger.error("MT5 inicializado, mas não foi possível ler account_info().")
+            mt5_module.shutdown()
+            return
+
+        self._mt5_ready = True
+        self.capital = float(getattr(info, "balance", self.capital) or self.capital)
+        logger.info(
+            "MT5 conectado | conta={} | servidor={} | saldo=R${:,.2f}",
+            getattr(info, "login", "N/A"), server_label, self.capital
+        )
 
     # ─── Execução principal ────────────────────────────────────────────────
 
@@ -228,16 +292,16 @@ class OrderExecutor:
 
         for attempt in range(retries):
             try:
+                # Garante que o símbolo está disponível antes de buscar tick
+                mt5.symbol_select(ticker, True)
+                time.sleep(0.1)
+
                 # Obtém preço atual
                 tick = mt5.symbol_info_tick(ticker)
                 if tick is None:
                     raise ValueError(f"Sem tick para {ticker}")
 
                 price = tick.ask if side == "buy" else tick.bid
-
-                # Garante que o símbolo está disponível
-                mt5.symbol_select(ticker, True)
-                time.sleep(0.1)
 
                 request = {
                     "action": mt5.TRADE_ACTION_DEAL,
@@ -326,10 +390,13 @@ class OrderExecutor:
                 return {}
             result = {}
             for pos in positions:
+                current_price = float(getattr(pos, "price_current", 0.0) or 0.0)
+                if current_price <= 0:
+                    current_price = float(getattr(pos, "price_open", 0.0) or 0.0)
                 result[pos.symbol] = {
-                    "shares": int(pos.volume * self.lot_size),
+                    "shares": int(float(pos.volume) * self.lot_size),
                     "avg_price": float(pos.price_open),
-                    "current_price": float(pos.price_current),
+                    "current_price": current_price,
                     "profit": float(pos.profit),
                 }
             return result
@@ -353,6 +420,7 @@ class OrderExecutor:
             try:
                 import MetaTrader5 as mt5  # noqa
                 mt5.shutdown()
+                self._mt5_ready = False
                 logger.info("MT5 desconectado")
             except Exception:
                 pass
