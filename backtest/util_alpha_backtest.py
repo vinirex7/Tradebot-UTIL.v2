@@ -8,13 +8,15 @@ Objetivo:
     Usar TODOS os ativos do Índice UTIL como universo elegível e montar uma
     carteira ativa long-only que tenta superar o benchmark UTIL sintético.
 
-Correção desta versão:
-    O benchmark deste arquivo agora usa EXATAMENTE o mesmo cálculo/base do
-    backtest principal: backtest.backtest_engine. Assim o resultado de
-    "Retorno benchmark" fica comparável entre main e infra-1.
+Correções desta versão:
+    1) O benchmark usa exatamente o mesmo cálculo/base do backtest principal:
+       backtest.backtest_engine.synthetic_util_benchmark.
+    2) O score agora funciona também em janelas curtas de 1 ano. Antes, o fator
+       de 12 meses ficava NaN quando não havia histórico suficiente e contaminava
+       o score inteiro, deixando a carteira 100% em caixa.
 
 Uso:
-    python backtest/util_alpha_backtest.py --start 2023-06-23 --end 2026-06-23
+    python backtest/util_alpha_backtest.py --start 2025-06-23 --end 2026-06-23
     python backtest/util_alpha_backtest.py --start 2023-06-23 --end 2026-06-23 --plot --csv
 """
 from __future__ import annotations
@@ -35,14 +37,10 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("Instale yfinance: pip install yfinance") from exc
 
-# Importa a MESMA definição de benchmark usada pelo backtest principal.
-# Não duplique o cálculo aqui, para não haver divergência entre branches/arquivos.
 from backtest.backtest_engine import UTIL_UNIVERSE as BENCHMARK_UTIL_UNIVERSE
 from backtest.backtest_engine import synthetic_util_benchmark
 
 
-# Universo completo elegível da estratégia infra-1.
-# Atenção: isso é o universo de seleção do bot, não o benchmark.
 STRATEGY_UNIVERSE: dict[str, dict[str, object]] = {
     "SBSP3":  {"weight": 19.999, "subsector": "saneamento",              "liquidity_tier": 1},
     "AXIA3":  {"weight": 17.291, "subsector": "transmissao",             "liquidity_tier": 1},
@@ -99,7 +97,7 @@ def download_ohlcv(tickers: list[str], start: str, end: str, verbose: bool = Tru
             df.columns = [str(c).lower() for c in df.columns]
             keep = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
             df = df[keep].dropna()
-            if len(df) >= 120 and "close" in df:
+            if len(df) >= 80 and "close" in df:
                 data[ticker] = df
                 if verbose:
                     print(f"  ✓ {ticker}: {len(df)} pregões")
@@ -117,12 +115,6 @@ def aligned_field(data: dict[str, pd.DataFrame], field: str) -> pd.DataFrame:
 
 
 def build_benchmark_from_shared_engine(data: dict[str, pd.DataFrame], target_index: pd.Index) -> pd.Series:
-    """Benchmark idêntico ao backtest principal.
-
-    O backtest principal calcula o UTIL sintético com synthetic_util_benchmark(data),
-    usando BENCHMARK_UTIL_UNIVERSE de backtest_engine. Este wrapper só reindexa para
-    a curva diária da estratégia, sem mudar pesos nem incluir/remover ativos.
-    """
     benchmark = synthetic_util_benchmark(data, target_index=target_index)
     return benchmark.reindex(target_index).ffill().dropna()
 
@@ -131,7 +123,7 @@ def cs_rank(frame: pd.DataFrame, higher_is_better: bool = True) -> pd.DataFrame:
     ranked = frame.rank(axis=1, pct=True)
     if not higher_is_better:
         ranked = 1.0 - ranked
-    return (ranked - 0.5) * 2.0
+    return ((ranked - 0.5) * 2.0).fillna(0.0)
 
 
 def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Series) -> pd.DataFrame:
@@ -142,7 +134,7 @@ def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Se
     ret_6m = closes.pct_change(126).sub(bench.pct_change(126), axis=0)
     ret_12m = closes.pct_change(252).sub(bench.pct_change(252), axis=0)
 
-    ema200 = closes.ewm(span=200, adjust=False).mean()
+    ema200 = closes.ewm(span=200, adjust=False, min_periods=40).mean()
     trend_strength = (closes / ema200 - 1.0).clip(-0.30, 0.30)
 
     ma20 = closes.rolling(20, min_periods=15).mean()
@@ -158,24 +150,26 @@ def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Se
         {t: {1: 0.08, 2: 0.00, 3: -0.08}.get(int(STRATEGY_UNIVERSE[t]["liquidity_tier"]), 0.0) for t in closes.columns}
     )
 
+    # Cada componente é preenchido com zero quando a janela histórica ainda não existe.
+    # Isso permite backtest de 1 ano sem deixar todo o score NaN.
     score = (
-        0.10 * cs_rank(ret_1m)
-        + 0.25 * cs_rank(ret_3m)
-        + 0.27 * cs_rank(ret_6m)
-        + 0.13 * cs_rank(ret_12m)
-        + 0.12 * cs_rank(trend_strength)
+        0.13 * cs_rank(ret_1m)
+        + 0.28 * cs_rank(ret_3m)
+        + 0.24 * cs_rank(ret_6m)
+        + 0.08 * cs_rank(ret_12m)
+        + 0.14 * cs_rank(trend_strength)
         + 0.08 * cs_rank(mean_reversion)
         + 0.03 * cs_rank(liquidity)
         + 0.02 * cs_rank(vol_63, higher_is_better=False)
     )
     score = score.add(tier_bonus, axis=1)
-    score = score.where(closes >= ema200, score - 0.18)
-    return score.replace([np.inf, -np.inf], np.nan)
+    score = score.where((closes >= ema200) | ema200.isna(), score - 0.18)
+    return score.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
 def regime_exposure(date: pd.Timestamp, benchmark: pd.Series, cash_floor: float) -> float:
     hist = benchmark.loc[:date].dropna()
-    if len(hist) < 80:
+    if len(hist) < 40:
         return 0.0
 
     now = hist.iloc[-1]
@@ -183,6 +177,9 @@ def regime_exposure(date: pd.Timestamp, benchmark: pd.Series, cash_floor: float)
     ma160 = hist.rolling(160, min_periods=80).mean().iloc[-1]
     peak = hist.cummax().iloc[-1]
     dd = now / peak - 1.0
+
+    if pd.isna(ma160):
+        ma160 = ma80
 
     if now > ma80 and ma80 >= ma160:
         gross = 1.00
