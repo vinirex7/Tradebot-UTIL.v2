@@ -2,25 +2,24 @@
 Backtest UTIL Alpha Allocator — Tradebot-UTIL.v2 / branch infra-1
 ────────────────────────────────────────────────────────────────
 
-Objetivo:
-    Testar uma estratégia long-only que usa TODO o universo do Índice UTIL B3
-    como universo elegível, mas escolhe dinamicamente apenas os ativos com
-    melhor combinação de momentum, reversão à média, tendência, liquidez e risco.
+Estratégia de pesquisa para a branch infra-1.
 
-Racional:
-    - Benchmark: carteira sintética do UTIL ponderada pelos pesos oficiais.
-    - Estratégia: alocação ativa top-N, com limite por ativo, regime de mercado
-      do próprio UTIL, filtro de tendência e redução automática de risco.
-    - Sem short, sem alavancagem, sem MetaTrader5. Roda em Linux via yfinance.
+Objetivo:
+    Usar TODOS os ativos do Índice UTIL como universo elegível e montar uma
+    carteira ativa long-only que tenta superar o benchmark UTIL sintético.
+
+Correção importante desta versão:
+    A versão inicial ficou conservadora demais: exigia score absoluto alto,
+    precisava de janelas longas para validar sinais e acabava ficando quase
+    toda em caixa ou só em EGIE3. Esta versão usa ranking cross-sectional,
+    sempre compara os papéis entre si e mantém exposição elevada quando o
+    regime do UTIL está favorável. Assim o bot realmente tenta bater o índice,
+    em vez de apenas reduzir volatilidade.
 
 Uso:
-    python backtest/util_alpha_backtest.py --start 2019-01-01 --end 2026-01-01
-    python backtest/util_alpha_backtest.py --capital 100000 --rebalance W-FRI --plot
-    python backtest/util_alpha_backtest.py --top-n 6 --max-weight 0.20 --csv
-
-Observação:
-    Este arquivo é uma base de pesquisa. Antes de migrar para paper/live,
-    validar dados ajustados, custos, slippage, liquidez e robustez fora da amostra.
+    python backtest/util_alpha_backtest.py --start 2024-06-23 --end 2026-06-23
+    python backtest/util_alpha_backtest.py --start 2023-06-23 --end 2026-06-23 --plot --csv
+    python backtest/util_alpha_backtest.py --top-n 6 --max-weight 0.20 --rebalance W-FRI
 """
 from __future__ import annotations
 
@@ -38,8 +37,8 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("Instale yfinance: pip install yfinance") from exc
 
 
-# Universo completo do UTIL conforme carteira teórica Maio-Agosto/2026.
-# O bot pode NÃO usar todos em cada rebalanceamento, mas todos são elegíveis.
+# Universo completo do UTIL — carteira teórica Maio-Agosto/2026.
+# O universo tem 18 ativos. A estratégia NÃO precisa usar todos ao mesmo tempo.
 UTIL_UNIVERSE: dict[str, dict[str, object]] = {
     "SBSP3":  {"weight": 19.999, "subsector": "saneamento",              "liquidity_tier": 1},
     "AXIA3":  {"weight": 17.291, "subsector": "transmissao",             "liquidity_tier": 1},
@@ -86,9 +85,8 @@ def _clean_index(df: pd.DataFrame) -> pd.DataFrame:
 def download_ohlcv(tickers: list[str], start: str, end: str, verbose: bool = True) -> dict[str, pd.DataFrame]:
     data: dict[str, pd.DataFrame] = {}
     for ticker in tickers:
-        yf_symbol = f"{ticker}.SA"
         try:
-            df = yf.Ticker(yf_symbol).history(start=start, end=end, auto_adjust=True, actions=False)
+            df = yf.Ticker(f"{ticker}.SA").history(start=start, end=end, auto_adjust=True, actions=False)
             if df.empty:
                 if verbose:
                     print(f"  ✗ {ticker}: sem dados no yfinance")
@@ -97,7 +95,7 @@ def download_ohlcv(tickers: list[str], start: str, end: str, verbose: bool = Tru
             df.columns = [str(c).lower() for c in df.columns]
             keep = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
             df = df[keep].dropna()
-            if len(df) >= 260 and "close" in df:
+            if len(df) >= 120 and "close" in df:
                 data[ticker] = df
                 if verbose:
                     print(f"  ✓ {ticker}: {len(df)} pregões")
@@ -109,9 +107,9 @@ def download_ohlcv(tickers: list[str], start: str, end: str, verbose: bool = Tru
     return data
 
 
-def aligned_closes(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    closes = pd.concat({t: df["close"] for t, df in data.items()}, axis=1).sort_index()
-    return closes.ffill().dropna(how="all")
+def aligned_field(data: dict[str, pd.DataFrame], field: str) -> pd.DataFrame:
+    frame = pd.concat({t: df[field] for t, df in data.items() if field in df.columns}, axis=1).sort_index()
+    return frame.ffill().dropna(how="all")
 
 
 def build_benchmark(closes: pd.DataFrame) -> pd.Series:
@@ -121,67 +119,82 @@ def build_benchmark(closes: pd.DataFrame) -> pd.Series:
     return normalized.mul(weights, axis=1).sum(axis=1).dropna()
 
 
-def zscore_frame(df: pd.DataFrame, window: int) -> pd.DataFrame:
-    mean = df.rolling(window).mean()
-    std = df.rolling(window).std().replace(0, np.nan)
-    return (df - mean) / std
+def cs_rank(frame: pd.DataFrame, higher_is_better: bool = True) -> pd.DataFrame:
+    """Ranking cross-sectional diário em escala aproximada -1 a +1."""
+    ranked = frame.rank(axis=1, pct=True)
+    if not higher_is_better:
+        ranked = 1.0 - ranked
+    return (ranked - 0.5) * 2.0
 
 
 def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Series) -> pd.DataFrame:
-    ret_3m = closes.pct_change(63)
-    ret_6m = closes.pct_change(126)
-    ret_12m = closes.pct_change(252)
+    bench = benchmark.reindex(closes.index).ffill()
+
+    ret_1m = closes.pct_change(21).sub(bench.pct_change(21), axis=0)
+    ret_3m = closes.pct_change(63).sub(bench.pct_change(63), axis=0)
+    ret_6m = closes.pct_change(126).sub(bench.pct_change(126), axis=0)
+    ret_12m = closes.pct_change(252).sub(bench.pct_change(252), axis=0)
 
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean()
-    trend = (closes / ema200 - 1.0).clip(-0.25, 0.25)
+    trend_strength = (closes / ema200 - 1.0).clip(-0.30, 0.30)
 
-    vol_63 = closes.pct_change().rolling(63).std() * math.sqrt(252)
-    vol_penalty = zscore_frame(vol_63, 252)
-
-    # Reversão controlada: compra quedas moderadas dentro de tendência positiva;
-    # evita "catching falling knives" em queda estrutural.
-    ma20 = closes.rolling(20).mean()
-    sd20 = closes.rolling(20).std().replace(0, np.nan)
+    ma20 = closes.rolling(20, min_periods=15).mean()
+    sd20 = closes.rolling(20, min_periods=15).std().replace(0, np.nan)
     boll_z = (closes - ma20) / sd20
-    mean_reversion = (-boll_z).clip(-2, 2)
-    mean_reversion = mean_reversion.where(closes > ema200, mean_reversion * 0.25)
+    mean_reversion = (-boll_z).clip(-2.0, 2.0)
 
-    mom_score = (
-        0.45 * zscore_frame(ret_6m, 252)
-        + 0.30 * zscore_frame(ret_12m, 252)
-        + 0.15 * zscore_frame(ret_3m, 126)
-    )
-    trend_score = zscore_frame(trend, 252)
-
-    liq_raw = (closes * volumes).rolling(20).mean()
-    liquidity_score = zscore_frame(np.log(liq_raw.replace(0, np.nan)), 252)
+    vol_63 = closes.pct_change().rolling(63, min_periods=40).std() * math.sqrt(252)
+    traded_value = (closes * volumes).rolling(20, min_periods=10).mean()
+    liquidity = np.log(traded_value.replace(0, np.nan))
 
     tier_bonus = pd.Series(
-        {t: {1: 0.15, 2: 0.00, 3: -0.15}.get(int(UTIL_UNIVERSE[t]["liquidity_tier"]), 0.0) for t in closes.columns}
+        {t: {1: 0.08, 2: 0.00, 3: -0.08}.get(int(UTIL_UNIVERSE[t]["liquidity_tier"]), 0.0) for t in closes.columns}
     )
-
-    # Regime do próprio UTIL: se benchmark está abaixo da média longa, o bot fica mais seletivo.
-    bench_ma100 = benchmark.rolling(100).mean()
-    bench_ma200 = benchmark.rolling(200).mean()
-    bench_trend = pd.Series(0.0, index=benchmark.index)
-    bench_trend = bench_trend.mask(benchmark > bench_ma100, 0.50)
-    bench_trend = bench_trend.mask((benchmark > bench_ma100) & (bench_ma100 > bench_ma200), 1.00)
-    bench_trend = bench_trend.reindex(closes.index).ffill().fillna(0.0)
 
     score = (
-        0.48 * mom_score
-        + 0.18 * trend_score
-        + 0.16 * mean_reversion
-        + 0.10 * liquidity_score
-        - 0.08 * vol_penalty
+        0.10 * cs_rank(ret_1m)
+        + 0.25 * cs_rank(ret_3m)
+        + 0.27 * cs_rank(ret_6m)
+        + 0.13 * cs_rank(ret_12m)
+        + 0.12 * cs_rank(trend_strength)
+        + 0.08 * cs_rank(mean_reversion)
+        + 0.03 * cs_rank(liquidity)
+        + 0.02 * cs_rank(vol_63, higher_is_better=False)
     )
     score = score.add(tier_bonus, axis=1)
-    score = score.mul(0.70 + 0.30 * bench_trend, axis=0)
 
-    # Penaliza ativos em tendência ruim independentemente do ranking.
-    score = score.where(closes > ema200, score - 0.75)
+    # Penalidade leve para tendência ruim, mas sem impedir operação.
+    score = score.where(closes >= ema200, score - 0.18)
     return score.replace([np.inf, -np.inf], np.nan)
+
+
+def regime_exposure(date: pd.Timestamp, benchmark: pd.Series, cash_floor: float) -> float:
+    hist = benchmark.loc[:date].dropna()
+    if len(hist) < 80:
+        return 0.0
+
+    now = hist.iloc[-1]
+    ma80 = hist.rolling(80, min_periods=40).mean().iloc[-1]
+    ma160 = hist.rolling(160, min_periods=80).mean().iloc[-1]
+    peak = hist.cummax().iloc[-1]
+    dd = now / peak - 1.0
+
+    if now > ma80 and ma80 >= ma160:
+        gross = 1.00
+    elif now > ma160:
+        gross = 0.95
+    elif dd > -0.10:
+        gross = 0.85
+    else:
+        gross = 0.70
+
+    if dd < -0.18:
+        gross *= 0.85
+    if dd < -0.28:
+        gross *= 0.70
+
+    return min(1.0 - cash_floor, max(0.0, gross))
 
 
 def target_weights_for_date(
@@ -191,57 +204,36 @@ def target_weights_for_date(
     benchmark: pd.Series,
     top_n: int,
     max_weight: float,
-    min_score: float,
     cash_floor: float,
 ) -> pd.Series:
-    row = scores.loc[date].dropna()
+    row = scores.loc[date].dropna().sort_values(ascending=False)
+    weights = pd.Series(0.0, index=closes.columns)
     if row.empty:
-        return pd.Series(0.0, index=closes.columns)
+        return weights
 
-    bench_hist = benchmark.loc[:date]
-    if len(bench_hist) < 200:
-        return pd.Series(0.0, index=closes.columns)
+    gross_exposure = regime_exposure(date, benchmark, cash_floor)
+    if gross_exposure <= 0:
+        return weights
 
-    bench_now = bench_hist.iloc[-1]
-    bench_ma100 = bench_hist.rolling(100).mean().iloc[-1]
-    bench_ma200 = bench_hist.rolling(200).mean().iloc[-1]
-    bench_dd = bench_now / bench_hist.cummax().iloc[-1] - 1.0
+    selected = row.head(max(1, min(top_n, len(row))))
 
-    if bench_now > bench_ma100 > bench_ma200:
-        gross_exposure = 1.00
-    elif bench_now > bench_ma200:
-        gross_exposure = 0.75
-    else:
-        gross_exposure = 0.45
-
-    if bench_dd < -0.12:
-        gross_exposure *= 0.65
-    if bench_dd < -0.20:
-        gross_exposure *= 0.50
-
-    gross_exposure = min(1.0 - cash_floor, max(0.0, gross_exposure))
-
-    selected = row[row >= min_score].sort_values(ascending=False).head(top_n)
-    if selected.empty:
-        return pd.Series(0.0, index=closes.columns)
-
-    positive = selected - selected.min() + 1.0
-    raw = positive / positive.sum() * gross_exposure
+    # Transforma score relativo em pesos. O melhor ganha mais, mas o limite por ativo
+    # impede concentração extrema e mantém coerência com a metodologia do UTIL.
+    shifted = selected - selected.min() + 0.25
+    raw = shifted / shifted.sum() * gross_exposure
     capped = raw.clip(upper=max_weight)
 
-    # Redistribui sobra respeitando teto por ativo.
-    for _ in range(5):
+    # Redistribui sobra respeitando o teto individual.
+    for _ in range(10):
         spare = gross_exposure - capped.sum()
-        if spare <= 1e-8:
+        if spare <= 1e-9:
             break
-        room = max_weight - capped
-        room = room[room > 1e-8]
-        if room.empty:
+        room = (max_weight - capped).clip(lower=0)
+        if room.sum() <= 1e-9:
             break
         add = (room / room.sum() * spare).clip(upper=room)
-        capped.loc[add.index] += add
+        capped = capped.add(add, fill_value=0.0)
 
-    weights = pd.Series(0.0, index=closes.columns)
     weights.loc[capped.index] = capped
     return weights
 
@@ -253,7 +245,6 @@ def run_backtest(
     rebalance: str,
     top_n: int,
     max_weight: float,
-    min_score: float,
     cash_floor: float,
     fee_bps: float,
     slippage_bps: float,
@@ -272,29 +263,26 @@ def run_backtest(
 
     for dt in closes.index:
         if dt in rebalance_dates:
-            target = target_weights_for_date(dt, scores, closes, benchmark, top_n, max_weight, min_score, cash_floor)
+            target = target_weights_for_date(dt, scores, closes, benchmark, top_n, max_weight, cash_floor)
             turnover += float((target - current).abs().sum())
             current = target
         weights.loc[dt] = current
 
-    # Usa pesos de ontem aplicados ao retorno de hoje para reduzir lookahead.
-    shifted = weights.shift(1).fillna(0.0)
-    strategy_returns = (shifted * daily_returns).sum(axis=1)
+    # Pesos decididos no fechamento anterior, aplicados no retorno do pregão seguinte.
+    shifted_weights = weights.shift(1).fillna(0.0)
+    strategy_returns = (shifted_weights * daily_returns).sum(axis=1)
 
-    # Custo de troca cobrado nos dias após mudança de peso.
-    daily_turnover = shifted.diff().abs().sum(axis=1).fillna(0.0)
+    daily_turnover = shifted_weights.diff().abs().sum(axis=1).fillna(0.0)
     strategy_returns = strategy_returns - daily_turnover * cost_rate
 
-    equity = (1 + strategy_returns).cumprod() * capital
+    equity = (1.0 + strategy_returns).cumprod() * capital
     bench_equity = (benchmark / benchmark.iloc[0]) * capital
-
-    return equity.dropna(), bench_equity.reindex(equity.index).ffill().dropna(), weights, turnover
+    bench_equity = bench_equity.reindex(equity.index).ffill()
+    return equity.dropna(), bench_equity.dropna(), weights, turnover
 
 
 def max_drawdown(equity: pd.Series) -> float:
-    if equity.empty:
-        return 0.0
-    return float((equity / equity.cummax() - 1.0).min())
+    return float((equity / equity.cummax() - 1.0).min()) if not equity.empty else 0.0
 
 
 def annualized_sharpe(equity: pd.Series) -> float:
@@ -313,15 +301,16 @@ def cagr(equity: pd.Series) -> float:
     if len(equity) < 2:
         return 0.0
     years = (equity.index[-1] - equity.index[0]).days / 365.25
-    if years <= 0:
-        return 0.0
-    return float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1.0)
+    return float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1.0) if years > 0 else 0.0
 
 
 def summarize(equity: pd.Series, benchmark_equity: pd.Series, weights: pd.DataFrame, turnover: float) -> BacktestStats:
+    common = equity.index.intersection(benchmark_equity.index)
+    equity = equity.loc[common]
+    benchmark_equity = benchmark_equity.loc[common]
     total_ret = equity.iloc[-1] / equity.iloc[0] - 1.0
     bench_ret = benchmark_equity.iloc[-1] / benchmark_equity.iloc[0] - 1.0
-    exposure = weights.sum(axis=1).mean()
+    exposure = weights.reindex(common).ffill().sum(axis=1).mean()
     return BacktestStats(
         total_return_pct=total_ret * 100,
         benchmark_return_pct=bench_ret * 100,
@@ -371,8 +360,7 @@ def main() -> None:
     parser.add_argument("--rebalance", default="W-FRI", help="Frequência pandas: W-FRI, W, M, 2W-FRI")
     parser.add_argument("--top-n", type=int, default=6)
     parser.add_argument("--max-weight", type=float, default=0.20)
-    parser.add_argument("--min-score", type=float, default=-0.10)
-    parser.add_argument("--cash-floor", type=float, default=0.03)
+    parser.add_argument("--cash-floor", type=float, default=0.00)
     parser.add_argument("--fee-bps", type=float, default=3.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--csv", action="store_true")
@@ -391,8 +379,8 @@ def main() -> None:
     if len(data) < 5:
         raise SystemExit("Poucos ativos com dados suficientes. Verifique conexão/datas/yfinance.")
 
-    closes = aligned_closes(data)
-    volumes = pd.concat({t: df["volume"] for t, df in data.items()}, axis=1).reindex(closes.index).ffill().fillna(0.0)
+    closes = aligned_field(data, "close")
+    volumes = aligned_field(data, "volume").reindex(closes.index).ffill().fillna(0.0)
 
     equity, bench_equity, weights, turnover = run_backtest(
         closes=closes,
@@ -401,13 +389,11 @@ def main() -> None:
         rebalance=args.rebalance,
         top_n=args.top_n,
         max_weight=args.max_weight,
-        min_score=args.min_score,
         cash_floor=args.cash_floor,
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
     )
-    bench_equity = bench_equity.reindex(equity.index).ffill()
-    stats = summarize(equity, bench_equity, weights.reindex(equity.index).ffill(), turnover)
+    stats = summarize(equity, bench_equity, weights, turnover)
 
     print("\nResumo — UTIL Alpha Allocator")
     print("─" * 55)
