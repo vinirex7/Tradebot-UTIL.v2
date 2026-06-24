@@ -8,38 +8,42 @@ Objetivo:
     Usar TODOS os ativos do Índice UTIL como universo elegível e montar uma
     carteira ativa long-only que tenta superar o benchmark UTIL sintético.
 
-Correção importante desta versão:
-    A versão inicial ficou conservadora demais: exigia score absoluto alto,
-    precisava de janelas longas para validar sinais e acabava ficando quase
-    toda em caixa ou só em EGIE3. Esta versão usa ranking cross-sectional,
-    sempre compara os papéis entre si e mantém exposição elevada quando o
-    regime do UTIL está favorável. Assim o bot realmente tenta bater o índice,
-    em vez de apenas reduzir volatilidade.
+Correção desta versão:
+    O benchmark deste arquivo agora usa EXATAMENTE o mesmo cálculo/base do
+    backtest principal: backtest.backtest_engine. Assim o resultado de
+    "Retorno benchmark" fica comparável entre main e infra-1.
 
 Uso:
-    python backtest/util_alpha_backtest.py --start 2024-06-23 --end 2026-06-23
+    python backtest/util_alpha_backtest.py --start 2023-06-23 --end 2026-06-23
     python backtest/util_alpha_backtest.py --start 2023-06-23 --end 2026-06-23 --plot --csv
-    python backtest/util_alpha_backtest.py --top-n 6 --max-weight 0.20 --rebalance W-FRI
 """
 from __future__ import annotations
 
 import argparse
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 try:
     import yfinance as yf
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("Instale yfinance: pip install yfinance") from exc
 
+# Importa a MESMA definição de benchmark usada pelo backtest principal.
+# Não duplique o cálculo aqui, para não haver divergência entre branches/arquivos.
+from backtest.backtest_engine import UTIL_UNIVERSE as BENCHMARK_UTIL_UNIVERSE
+from backtest.backtest_engine import synthetic_util_benchmark
 
-# Universo completo do UTIL — carteira teórica Maio-Agosto/2026.
-# O universo tem 18 ativos. A estratégia NÃO precisa usar todos ao mesmo tempo.
-UTIL_UNIVERSE: dict[str, dict[str, object]] = {
+
+# Universo completo elegível da estratégia infra-1.
+# Atenção: isso é o universo de seleção do bot, não o benchmark.
+STRATEGY_UNIVERSE: dict[str, dict[str, object]] = {
     "SBSP3":  {"weight": 19.999, "subsector": "saneamento",              "liquidity_tier": 1},
     "AXIA3":  {"weight": 17.291, "subsector": "transmissao",             "liquidity_tier": 1},
     "EQTL3":  {"weight": 11.431, "subsector": "distribuicao",            "liquidity_tier": 1},
@@ -112,15 +116,18 @@ def aligned_field(data: dict[str, pd.DataFrame], field: str) -> pd.DataFrame:
     return frame.ffill().dropna(how="all")
 
 
-def build_benchmark(closes: pd.DataFrame) -> pd.Series:
-    weights = pd.Series({t: float(UTIL_UNIVERSE[t]["weight"]) for t in closes.columns}, dtype=float)
-    weights = weights / weights.sum()
-    normalized = closes / closes.iloc[0]
-    return normalized.mul(weights, axis=1).sum(axis=1).dropna()
+def build_benchmark_from_shared_engine(data: dict[str, pd.DataFrame], target_index: pd.Index) -> pd.Series:
+    """Benchmark idêntico ao backtest principal.
+
+    O backtest principal calcula o UTIL sintético com synthetic_util_benchmark(data),
+    usando BENCHMARK_UTIL_UNIVERSE de backtest_engine. Este wrapper só reindexa para
+    a curva diária da estratégia, sem mudar pesos nem incluir/remover ativos.
+    """
+    benchmark = synthetic_util_benchmark(data, target_index=target_index)
+    return benchmark.reindex(target_index).ffill().dropna()
 
 
 def cs_rank(frame: pd.DataFrame, higher_is_better: bool = True) -> pd.DataFrame:
-    """Ranking cross-sectional diário em escala aproximada -1 a +1."""
     ranked = frame.rank(axis=1, pct=True)
     if not higher_is_better:
         ranked = 1.0 - ranked
@@ -135,7 +142,6 @@ def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Se
     ret_6m = closes.pct_change(126).sub(bench.pct_change(126), axis=0)
     ret_12m = closes.pct_change(252).sub(bench.pct_change(252), axis=0)
 
-    ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean()
     trend_strength = (closes / ema200 - 1.0).clip(-0.30, 0.30)
 
@@ -149,7 +155,7 @@ def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Se
     liquidity = np.log(traded_value.replace(0, np.nan))
 
     tier_bonus = pd.Series(
-        {t: {1: 0.08, 2: 0.00, 3: -0.08}.get(int(UTIL_UNIVERSE[t]["liquidity_tier"]), 0.0) for t in closes.columns}
+        {t: {1: 0.08, 2: 0.00, 3: -0.08}.get(int(STRATEGY_UNIVERSE[t]["liquidity_tier"]), 0.0) for t in closes.columns}
     )
 
     score = (
@@ -163,8 +169,6 @@ def compute_scores(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: pd.Se
         + 0.02 * cs_rank(vol_63, higher_is_better=False)
     )
     score = score.add(tier_bonus, axis=1)
-
-    # Penalidade leve para tendência ruim, mas sem impedir operação.
     score = score.where(closes >= ema200, score - 0.18)
     return score.replace([np.inf, -np.inf], np.nan)
 
@@ -216,14 +220,10 @@ def target_weights_for_date(
         return weights
 
     selected = row.head(max(1, min(top_n, len(row))))
-
-    # Transforma score relativo em pesos. O melhor ganha mais, mas o limite por ativo
-    # impede concentração extrema e mantém coerência com a metodologia do UTIL.
     shifted = selected - selected.min() + 0.25
     raw = shifted / shifted.sum() * gross_exposure
     capped = raw.clip(upper=max_weight)
 
-    # Redistribui sobra respeitando o teto individual.
     for _ in range(10):
         spare = gross_exposure - capped.sum()
         if spare <= 1e-9:
@@ -239,6 +239,7 @@ def target_weights_for_date(
 
 
 def run_backtest(
+    data: dict[str, pd.DataFrame],
     closes: pd.DataFrame,
     volumes: pd.DataFrame,
     capital: float,
@@ -249,9 +250,12 @@ def run_backtest(
     fee_bps: float,
     slippage_bps: float,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame, float]:
-    benchmark = build_benchmark(closes)
-    scores = compute_scores(closes, volumes, benchmark)
+    benchmark = build_benchmark_from_shared_engine(data, closes.index)
+    closes = closes.reindex(benchmark.index).ffill().dropna(how="all")
+    volumes = volumes.reindex(closes.index).ffill().fillna(0.0)
+    benchmark = benchmark.reindex(closes.index).ffill().dropna()
 
+    scores = compute_scores(closes, volumes, benchmark)
     daily_returns = closes.pct_change().fillna(0.0)
     rebalance_dates = closes.resample(rebalance).last().index
     rebalance_dates = closes.index.intersection(rebalance_dates)
@@ -268,10 +272,8 @@ def run_backtest(
             current = target
         weights.loc[dt] = current
 
-    # Pesos decididos no fechamento anterior, aplicados no retorno do pregão seguinte.
     shifted_weights = weights.shift(1).fillna(0.0)
     strategy_returns = (shifted_weights * daily_returns).sum(axis=1)
-
     daily_turnover = shifted_weights.diff().abs().sum(axis=1).fillna(0.0)
     strategy_returns = strategy_returns - daily_turnover * cost_rate
 
@@ -368,12 +370,13 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    tickers = list(UTIL_UNIVERSE.keys())
+    tickers = list(STRATEGY_UNIVERSE.keys())
     if not args.quiet:
         print("Tradebot-UTIL.v2 — Backtest UTIL Alpha Allocator")
         print(f"Universo UTIL elegível: {len(tickers)} ativos")
         print("Ativos:", ", ".join(tickers))
         print(f"Período: {args.start} → {args.end} | Capital: R$ {args.capital:,.2f}")
+        print("Benchmark compartilhado:", ", ".join(BENCHMARK_UTIL_UNIVERSE.keys()))
 
     data = download_ohlcv(tickers, args.start, args.end, verbose=not args.quiet)
     if len(data) < 5:
@@ -383,6 +386,7 @@ def main() -> None:
     volumes = aligned_field(data, "volume").reindex(closes.index).ffill().fillna(0.0)
 
     equity, bench_equity, weights, turnover = run_backtest(
+        data=data,
         closes=closes,
         volumes=volumes,
         capital=args.capital,
