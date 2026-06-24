@@ -11,6 +11,7 @@ Correção de benchmark:
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 import warnings
@@ -21,29 +22,41 @@ from typing import Optional
 warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+
 # Mock do MetaTrader5 para permitir backtest em Linux sem MT5 instalado.
-mt5_mock = types.ModuleType("MetaTrader5")
-for _attr in [
-    "TIMEFRAME_M1", "TIMEFRAME_M5", "TIMEFRAME_M15", "TIMEFRAME_M30",
-    "TIMEFRAME_H1", "TIMEFRAME_H4", "TIMEFRAME_D1", "TIMEFRAME_W1", "TIMEFRAME_MN1",
-    "ORDER_TYPE_BUY", "ORDER_TYPE_SELL", "TRADE_ACTION_DEAL",
-    "ORDER_TIME_GTC", "ORDER_FILLING_IOC",
-]:
-    setattr(mt5_mock, _attr, 0)
-mt5_mock.TRADE_RETCODE_DONE = 10009
-mt5_mock.initialize = lambda **kw: False
-mt5_mock.shutdown = lambda: None
-mt5_mock.account_info = lambda: None
-mt5_mock.terminal_info = lambda: None
-mt5_mock.symbol_info = lambda s: None
-mt5_mock.symbol_select = lambda s, b: False
-mt5_mock.copy_rates_from_pos = lambda *a, **kw: None
-mt5_mock.symbol_info_tick = lambda s: None
-mt5_mock.positions_get = lambda **kw: []
-mt5_mock.history_deals_get = lambda *a: []
-mt5_mock.order_send = lambda r: None
-mt5_mock.last_error = lambda: (0, "OK")
-sys.modules["MetaTrader5"] = mt5_mock
+# IMPORTANTE: não sobrescrever a biblioteca real no Windows/MT5 live.
+def _install_mt5_mock_if_missing() -> None:
+    if "MetaTrader5" in sys.modules:
+        return
+    if importlib.util.find_spec("MetaTrader5") is not None:
+        return
+
+    mt5_mock = types.ModuleType("MetaTrader5")
+    for _attr in [
+        "TIMEFRAME_M1", "TIMEFRAME_M5", "TIMEFRAME_M15", "TIMEFRAME_M30",
+        "TIMEFRAME_H1", "TIMEFRAME_H4", "TIMEFRAME_D1", "TIMEFRAME_W1", "TIMEFRAME_MN1",
+        "ORDER_TYPE_BUY", "ORDER_TYPE_SELL", "TRADE_ACTION_DEAL",
+        "ORDER_TIME_GTC", "ORDER_FILLING_IOC",
+    ]:
+        setattr(mt5_mock, _attr, 0)
+    mt5_mock.TRADE_RETCODE_DONE = 10009
+    mt5_mock.initialize = lambda **kw: False
+    mt5_mock.shutdown = lambda: None
+    mt5_mock.account_info = lambda: None
+    mt5_mock.terminal_info = lambda: None
+    mt5_mock.symbol_info = lambda s: None
+    mt5_mock.symbol_select = lambda s, b: False
+    mt5_mock.copy_rates_from_pos = lambda *a, **kw: None
+    mt5_mock.copy_rates_range = lambda *a, **kw: None
+    mt5_mock.symbol_info_tick = lambda s: None
+    mt5_mock.positions_get = lambda **kw: []
+    mt5_mock.history_deals_get = lambda *a: []
+    mt5_mock.order_send = lambda r: None
+    mt5_mock.last_error = lambda: (0, "OK")
+    sys.modules["MetaTrader5"] = mt5_mock
+
+
+_install_mt5_mock_if_missing()
 
 import numpy as np
 import pandas as pd
