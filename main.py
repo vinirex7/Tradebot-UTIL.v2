@@ -137,18 +137,27 @@ class TradebotUTILv4:
         """Sincroniza posições atuais do MT5 com o estado interno."""
         try:
             positions = self.executor.get_current_positions()
-            equity = self.executor.get_account_equity()
+            equity = float(self.executor.get_account_equity() or 0.0)
+
             if equity > 0:
                 self.portfolio.equity = equity
                 self.risk.update_equity(equity)
-            if positions:
-                # Converte posições MT5 para pesos
-                total_value = sum(p["shares"] * p["current_price"] for p in positions.values())
-                if total_value > 0:
-                    self.portfolio.positions = {
-                        ticker: (p["shares"] * p["current_price"]) / equity
-                        for ticker, p in positions.items()
-                    }
+            else:
+                equity = float(self.portfolio.equity or self.cfg["trading"].get("capital", 0.0))
+
+            synced_positions: dict[str, float] = {}
+            if positions and equity > 0:
+                for ticker, pos in positions.items():
+                    shares = float(pos.get("shares", 0) or 0)
+                    current_price = float(pos.get("current_price", 0) or pos.get("avg_price", 0) or 0)
+                    if shares <= 0 or current_price <= 0:
+                        continue
+                    weight = (shares * current_price) / equity
+                    if weight > 0:
+                        synced_positions[ticker] = weight
+
+            self.portfolio.positions = synced_positions
+
             logger.info(
                 "Sincronizado com MT5 | {} posições | equity R${:,.0f}",
                 len(self.portfolio.positions), equity
