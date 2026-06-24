@@ -164,9 +164,12 @@ class OrderExecutor:
         """
         Inicializa MT5 com chamadas diretas.
 
-        Não usa lambdas nem argumentos posicionais. O primeiro caminho testado é
-        exatamente o padrão que funcionou no PowerShell: mt5.initialize(path=p).
+        A primeira tentativa não chama shutdown antes. Ela replica exatamente o teste
+        que funcionou no PowerShell: mt5.initialize(path=p).
         """
+        def has_account() -> bool:
+            return mt5_module.account_info() is not None
+
         def reset_mt5() -> None:
             try:
                 mt5_module.shutdown()
@@ -174,27 +177,27 @@ class OrderExecutor:
                 pass
 
         if path:
-            reset_mt5()
+            logger.info("Tentando MT5 initialize via path: {}", path)
             try:
                 ok = mt5_module.initialize(path=path)
             except Exception as exc:
-                logger.debug("MT5 initialize(path) gerou exceção: {}", exc)
+                logger.warning("MT5 initialize(path) gerou exceção: {}", exc)
                 ok = False
-            if ok and mt5_module.account_info() is not None:
+            if ok and has_account():
                 logger.info("MT5 initialize OK via path")
                 return True
-            logger.debug("MT5 initialize(path) falhou: {}", mt5_module.last_error())
+            logger.warning("MT5 initialize(path) falhou | ok={} | erro={}", ok, mt5_module.last_error())
 
             reset_mt5()
             try:
                 ok = mt5_module.initialize(path=path, timeout=timeout)
             except Exception as exc:
-                logger.debug("MT5 initialize(path, timeout) gerou exceção: {}", exc)
+                logger.warning("MT5 initialize(path, timeout) gerou exceção: {}", exc)
                 ok = False
-            if ok and mt5_module.account_info() is not None:
+            if ok and has_account():
                 logger.info("MT5 initialize OK via path+timeout")
                 return True
-            logger.debug("MT5 initialize(path, timeout) falhou: {}", mt5_module.last_error())
+            logger.warning("MT5 initialize(path, timeout) falhou | ok={} | erro={}", ok, mt5_module.last_error())
 
         if path and login and password and server:
             reset_mt5()
@@ -207,12 +210,12 @@ class OrderExecutor:
                     timeout=timeout,
                 )
             except Exception as exc:
-                logger.debug("MT5 initialize(path+credenciais) gerou exceção: {}", exc)
+                logger.warning("MT5 initialize(path+credenciais) gerou exceção: {}", exc)
                 ok = False
-            if ok and mt5_module.account_info() is not None:
+            if ok and has_account():
                 logger.info("MT5 initialize OK via path+credenciais")
                 return True
-            logger.debug("MT5 initialize(path+credenciais) falhou: {}", mt5_module.last_error())
+            logger.warning("MT5 initialize(path+credenciais) falhou | ok={} | erro={}", ok, mt5_module.last_error())
 
         if login and password and server:
             reset_mt5()
@@ -224,23 +227,23 @@ class OrderExecutor:
                     timeout=timeout,
                 )
             except Exception as exc:
-                logger.debug("MT5 initialize(credenciais) gerou exceção: {}", exc)
+                logger.warning("MT5 initialize(credenciais) gerou exceção: {}", exc)
                 ok = False
-            if ok and mt5_module.account_info() is not None:
+            if ok and has_account():
                 logger.info("MT5 initialize OK via credenciais")
                 return True
-            logger.debug("MT5 initialize(credenciais) falhou: {}", mt5_module.last_error())
+            logger.warning("MT5 initialize(credenciais) falhou | ok={} | erro={}", ok, mt5_module.last_error())
 
         reset_mt5()
         try:
             ok = mt5_module.initialize(timeout=timeout)
         except Exception as exc:
-            logger.debug("MT5 initialize(timeout) gerou exceção: {}", exc)
+            logger.warning("MT5 initialize(timeout) gerou exceção: {}", exc)
             ok = False
-        if ok and mt5_module.account_info() is not None:
+        if ok and has_account():
             logger.info("MT5 initialize OK via timeout")
             return True
-        logger.debug("MT5 initialize(timeout) falhou: {}", mt5_module.last_error())
+        logger.warning("MT5 initialize(timeout) falhou | ok={} | erro={}", ok, mt5_module.last_error())
 
         return False
 
