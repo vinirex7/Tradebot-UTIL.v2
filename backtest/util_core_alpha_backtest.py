@@ -2,27 +2,15 @@
 Backtest UTIL Hybrid System — Tradebot-UTIL.v2 / branch infra-1
 ───────────────────────────────────────────────────────────────
 
-Sistema híbrido inspirado no documento técnico do Tradebot-UTIL:
+Sistema híbrido com diagnóstico por camada:
+- Core book
+- Mean Reversion
+- Momentum Macro
+- Pair/Eventos long-only
+- Caixa
 
-1) Core book
-   Replica parcialmente a estrutura do UTIL, mas foca nas maiores posições do
-   índice para não se descolar demais do benchmark.
-
-2) Alpha 1 — Mean Reversion
-   Opera apenas quando existe vantagem estatística clara: fechamento abaixo da
-   banda inferior, RSI baixo, z-score negativo e filtro de tendência/macro não
-   deteriorado.
-
-3) Alpha 2 — Momentum Macro
-   Entra nos top 3-5 nomes quando o regime do setor está favorável.
-
-4) Eventos / Pair trading
-   Nesta versão ficam como módulos leves/defensivos: o backtest reserva a
-   estrutura, mas não faz short nem usa dados externos de ANEEL/Copom/DI.
-
-Uso:
-    python backtest/util_core_alpha_backtest.py --start 2025-06-23 --end 2026-06-23
-    python backtest/util_core_alpha_backtest.py --start 2024-06-23 --end 2026-06-23 --plot --csv
+Além do retorno total, o script imprime a atribuição de resultado por camada
+para identificar qual alocação está gerando prejuízo e qual está agregando valor.
 """
 from __future__ import annotations
 
@@ -48,6 +36,7 @@ from backtest.backtest_engine import UTIL_UNIVERSE, synthetic_util_benchmark
 CORE_TICKERS = ["SBSP3", "AXIA3", "EQTL3", "ENEV3", "CPLE3"]
 MEAN_REVERSION_TICKERS = ["SBSP3", "EQTL3", "CPLE3", "EGIE3", "TAEE11", "CMIG4", "CSMG3", "SAPR11"]
 MOMENTUM_TICKERS = ["SBSP3", "AXIA3", "EQTL3", "ENEV3", "CPLE3", "CMIG4", "ENGI11", "EGIE3"]
+BOOKS = ["core", "mean_reversion", "momentum", "pair_event"]
 
 LIQUIDITY_TIER = {
     "SBSP3": 1, "AXIA3": 1, "EQTL3": 1, "ENEV3": 1, "CPLE3": 1, "CMIG4": 1,
@@ -155,14 +144,12 @@ def compute_indicators(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: p
     rsi14 = rsi(closes, 14)
     ema50 = closes.ewm(span=50, adjust=False, min_periods=30).mean()
     ema200 = closes.ewm(span=200, adjust=False, min_periods=60).mean()
-
     bench = benchmark.reindex(closes.index).ffill()
     rel_1m = closes.pct_change(21).sub(bench.pct_change(21), axis=0)
     rel_3m = closes.pct_change(63).sub(bench.pct_change(63), axis=0)
     rel_6m = closes.pct_change(126).sub(bench.pct_change(126), axis=0)
     vol = closes.pct_change().rolling(63, min_periods=35).std() * math.sqrt(252)
     traded_value = np.log((closes * volumes).rolling(20, min_periods=10).mean().replace(0, np.nan))
-
     tier_bonus = pd.Series({t: {1: 0.04, 2: 0.00, 3: -0.04}.get(LIQUIDITY_TIER.get(t, 2), 0.0) for t in closes.columns})
     momentum_score = (
         0.28 * cs_rank(rel_1m)
@@ -172,22 +159,13 @@ def compute_indicators(closes: pd.DataFrame, volumes: pd.DataFrame, benchmark: p
         + 0.05 * cs_rank(traded_value)
         + 0.05 * cs_rank(vol, higher_is_better=False)
     ).add(tier_bonus, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
     mr_edge = (
         0.48 * cs_rank(-z20)
         + 0.32 * cs_rank(30 - rsi14)
         + 0.12 * cs_rank(traded_value)
         + 0.08 * cs_rank(vol, higher_is_better=False)
     ).add(tier_bonus, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    return {
-        "z20": z20,
-        "rsi14": rsi14,
-        "ema50": ema50,
-        "ema200": ema200,
-        "momentum_score": momentum_score,
-        "mr_edge": mr_edge,
-    }
+    return {"z20": z20, "rsi14": rsi14, "ema50": ema50, "ema200": ema200, "momentum_score": momentum_score, "mr_edge": mr_edge}
 
 
 def cap_and_redistribute(weights: pd.Series, max_asset: float, target_sum: float | None = None) -> pd.Series:
@@ -214,13 +192,11 @@ def mean_reversion_book(date: pd.Timestamp, closes: pd.DataFrame, indicators: di
     out = pd.Series(0.0, index=cols)
     if exposure <= 0 or regime == "adverse":
         return out
-
     z = indicators["z20"].loc[date]
     r = indicators["rsi14"].loc[date]
     ema200 = indicators["ema200"].loc[date]
     edge = indicators["mr_edge"].loc[date]
     price = closes.loc[date]
-
     eligible = []
     for ticker in MEAN_REVERSION_TICKERS:
         if ticker not in cols:
@@ -229,7 +205,6 @@ def mean_reversion_book(date: pd.Timestamp, closes: pd.DataFrame, indicators: di
         signal_ok = (z[ticker] <= -1.15 and r[ticker] <= 40) or (z[ticker] <= -1.65 and r[ticker] <= 48)
         if trend_ok and signal_ok:
             eligible.append(ticker)
-
     if not eligible:
         return out
     selected = edge.loc[eligible].sort_values(ascending=False).head(4)
@@ -244,7 +219,6 @@ def momentum_book(date: pd.Timestamp, closes: pd.DataFrame, indicators: dict[str
     out = pd.Series(0.0, index=cols)
     if exposure <= 0 or regime != "bull":
         return out
-
     score = indicators["momentum_score"].loc[date]
     ema50 = indicators["ema50"].loc[date]
     price = closes.loc[date]
@@ -259,11 +233,6 @@ def momentum_book(date: pd.Timestamp, closes: pd.DataFrame, indicators: dict[str
 
 
 def pair_tilt_book(date: pd.Timestamp, closes: pd.DataFrame, exposure: float) -> pd.Series:
-    """Long-only pair tilt simples.
-
-    Não faz short. Apenas desloca pequeno peso para o lado relativamente barato
-    quando o spread entre pares está esticado. Módulo conservador.
-    """
     out = pd.Series(0.0, index=closes.columns)
     if exposure <= 0 or len(closes.loc[:date]) < 80:
         return out
@@ -288,65 +257,92 @@ def pair_tilt_book(date: pd.Timestamp, closes: pd.DataFrame, exposure: float) ->
     return out
 
 
-def target_weights_for_date(date: pd.Timestamp, closes: pd.DataFrame, benchmark: pd.Series, indicators: dict[str, pd.DataFrame], args: argparse.Namespace) -> pd.Series:
-    regime = market_regime(date, benchmark)
-
+def layer_exposures(regime: str, args: argparse.Namespace) -> tuple[float, float, float, float]:
     if regime == "bull":
-        core_exp, mr_exp, mom_exp, pair_exp = args.core_bull, args.mr_bull, args.momentum_bull, args.pair_bull
-    elif regime == "neutral":
-        core_exp, mr_exp, mom_exp, pair_exp = args.core_neutral, args.mr_neutral, args.momentum_neutral, args.pair_neutral
-    elif regime == "adverse":
-        core_exp, mr_exp, mom_exp, pair_exp = args.core_adverse, args.mr_adverse, args.momentum_adverse, args.pair_adverse
-    else:
-        return pd.Series(0.0, index=closes.columns)
-
-    core = core_book(closes.columns, core_exp, args.max_asset)
-    mr = mean_reversion_book(date, closes, indicators, regime, mr_exp, args.max_asset)
-    mom = momentum_book(date, closes, indicators, regime, mom_exp, args.max_asset, args.top_n)
-    pair = pair_tilt_book(date, closes, pair_exp)
-
-    target = core + mr + mom + pair
-    max_exposure = min(args.max_exposure, core_exp + mr_exp + mom_exp + pair_exp)
-    if target.sum() > max_exposure:
-        target *= max_exposure / target.sum()
-    return cap_and_redistribute(target, args.max_asset, min(max_exposure, target.sum()))
+        return args.core_bull, args.mr_bull, args.momentum_bull, args.pair_bull
+    if regime == "neutral":
+        return args.core_neutral, args.mr_neutral, args.momentum_neutral, args.pair_neutral
+    if regime == "adverse":
+        return args.core_adverse, args.mr_adverse, args.momentum_adverse, args.pair_adverse
+    return 0.0, 0.0, 0.0, 0.0
 
 
-def run_backtest(data: dict[str, pd.DataFrame], closes: pd.DataFrame, volumes: pd.DataFrame, capital: float, args: argparse.Namespace) -> tuple[pd.Series, pd.Series, pd.DataFrame, float]:
+def target_books_for_date(date: pd.Timestamp, closes: pd.DataFrame, benchmark: pd.Series, indicators: dict[str, pd.DataFrame], args: argparse.Namespace) -> dict[str, pd.Series]:
+    regime = market_regime(date, benchmark)
+    core_exp, mr_exp, mom_exp, pair_exp = layer_exposures(regime, args)
+    books = {
+        "core": core_book(closes.columns, core_exp, args.max_asset),
+        "mean_reversion": mean_reversion_book(date, closes, indicators, regime, mr_exp, args.max_asset),
+        "momentum": momentum_book(date, closes, indicators, regime, mom_exp, args.max_asset, args.top_n),
+        "pair_event": pair_tilt_book(date, closes, pair_exp),
+    }
+    total = sum(books.values(), pd.Series(0.0, index=closes.columns))
+    if total.sum() > args.max_exposure:
+        scale = args.max_exposure / total.sum()
+        books = {name: w * scale for name, w in books.items()}
+    return books
+
+
+def combine_books(books: dict[str, pd.Series], max_asset: float, max_exposure: float) -> pd.Series:
+    total = sum(books.values(), pd.Series(0.0, index=next(iter(books.values())).index))
+    if total.sum() > max_exposure:
+        total *= max_exposure / total.sum()
+    return cap_and_redistribute(total, max_asset, min(max_exposure, total.sum()))
+
+
+def run_backtest(data: dict[str, pd.DataFrame], closes: pd.DataFrame, volumes: pd.DataFrame, capital: float, args: argparse.Namespace) -> tuple[pd.Series, pd.Series, pd.DataFrame, float, dict[str, pd.Series], pd.DataFrame]:
     benchmark = synthetic_util_benchmark(data, target_index=closes.index)
     closes = closes.reindex(benchmark.index).ffill().dropna(how="all")
     volumes = volumes.reindex(closes.index).ffill().fillna(0.0)
     benchmark = benchmark.reindex(closes.index).ffill().dropna()
     indicators = compute_indicators(closes, volumes, benchmark)
-
     daily_returns = closes.pct_change().fillna(0.0)
-    rebalance_dates = closes.resample(args.rebalance).last().index
-    rebalance_dates = closes.index.intersection(rebalance_dates)
-    # Também permite entradas semanais de mean reversion sem girar demais o core.
+
+    rebalance_dates = closes.index.intersection(closes.resample(args.rebalance).last().index)
     signal_dates = closes.resample(args.signal_frequency).last().index
     rebalance_dates = closes.index.intersection(rebalance_dates.union(signal_dates))
 
     weights = pd.DataFrame(0.0, index=closes.index, columns=closes.columns)
-    current = pd.Series(0.0, index=closes.columns)
+    book_weights = {name: pd.DataFrame(0.0, index=closes.index, columns=closes.columns) for name in BOOKS}
+    current_books = {name: pd.Series(0.0, index=closes.columns) for name in BOOKS}
+    current_total = pd.Series(0.0, index=closes.columns)
     turnover = 0.0
-    cost_rate = (args.fee_bps + args.slippage_bps) / 10_000
+    book_turnover = {name: 0.0 for name in BOOKS}
 
     for dt in closes.index:
         if dt in rebalance_dates:
-            target = target_weights_for_date(dt, closes, benchmark, indicators, args)
-            turnover += float((target - current).abs().sum())
-            current = target
-        weights.loc[dt] = current
+            target_books = target_books_for_date(dt, closes, benchmark, indicators, args)
+            target_total = combine_books(target_books, args.max_asset, args.max_exposure)
+            raw_total = sum(target_books.values(), pd.Series(0.0, index=closes.columns))
+            scale = float(target_total.sum() / raw_total.sum()) if raw_total.sum() > 1e-12 else 0.0
+            target_books = {name: w * scale for name, w in target_books.items()}
 
+            turnover += float((target_total - current_total).abs().sum())
+            for name in BOOKS:
+                book_turnover[name] += float((target_books[name] - current_books[name]).abs().sum())
+                current_books[name] = target_books[name]
+            current_total = target_total
+        weights.loc[dt] = current_total
+        for name in BOOKS:
+            book_weights[name].loc[dt] = current_books[name]
+
+    cost_rate = (args.fee_bps + args.slippage_bps) / 10_000
     shifted = weights.shift(1).fillna(0.0)
     strategy_returns = (shifted * daily_returns).sum(axis=1)
     daily_turnover = shifted.diff().abs().sum(axis=1).fillna(0.0)
     strategy_returns = strategy_returns - daily_turnover * cost_rate
 
+    book_returns = {}
+    for name in BOOKS:
+        shifted_book = book_weights[name].shift(1).fillna(0.0)
+        gross = (shifted_book * daily_returns).sum(axis=1)
+        cost = shifted_book.diff().abs().sum(axis=1).fillna(0.0) * cost_rate
+        book_returns[name] = gross - cost
+
     equity = (1.0 + strategy_returns).cumprod() * capital
     bench_equity = (benchmark / benchmark.iloc[0]) * capital
     bench_equity = bench_equity.reindex(equity.index).ffill()
-    return equity.dropna(), bench_equity.dropna(), weights, turnover
+    return equity.dropna(), bench_equity.dropna(), weights, turnover, book_returns, pd.DataFrame(book_turnover, index=["turnover"]).T
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -391,11 +387,39 @@ def summarize(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame, tu
     )
 
 
-def save_outputs(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame, output_dir: Path, csv: bool, plot: bool) -> None:
+def layer_attribution(book_returns: dict[str, pd.Series], weights: pd.DataFrame, book_turnover: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    total_return = sum(book_returns.values(), pd.Series(0.0, index=next(iter(book_returns.values())).index))
+    for name, rets in book_returns.items():
+        contrib = (1.0 + rets).prod() - 1.0
+        avg_daily = rets.mean()
+        vol = rets.std() * math.sqrt(252) if rets.std() > 0 else 0.0
+        shp = (rets.mean() / rets.std() * math.sqrt(252)) if rets.std() > 0 else 0.0
+        rows.append({
+            "camada": name,
+            "contrib_pct": contrib * 100,
+            "ret_medio_diario_bp": avg_daily * 10_000,
+            "vol_anual_pct": vol * 100,
+            "sharpe_aprox": shp,
+            "turnover": float(book_turnover.loc[name, "turnover"]) if name in book_turnover.index else 0.0,
+        })
+    out = pd.DataFrame(rows).set_index("camada").sort_values("contrib_pct", ascending=False)
+    out.loc["total_aprox"] = {
+        "contrib_pct": ((1 + total_return).prod() - 1) * 100,
+        "ret_medio_diario_bp": total_return.mean() * 10_000,
+        "vol_anual_pct": total_return.std() * math.sqrt(252) * 100 if total_return.std() > 0 else 0.0,
+        "sharpe_aprox": total_return.mean() / total_return.std() * math.sqrt(252) if total_return.std() > 0 else 0.0,
+        "turnover": float(book_turnover["turnover"].sum()),
+    }
+    return out
+
+
+def save_outputs(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame, attribution: pd.DataFrame, output_dir: Path, csv: bool, plot: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if csv:
         pd.DataFrame({"strategy": equity, "benchmark_util": benchmark}).to_csv(output_dir / "util_hybrid_equity.csv")
         weights.to_csv(output_dir / "util_hybrid_weights.csv")
+        attribution.to_csv(output_dir / "util_hybrid_attribution.csv")
         print(f"CSV salvo em: {output_dir}")
     if plot:
         try:
@@ -417,6 +441,20 @@ def save_outputs(equity: pd.Series, benchmark: pd.Series, weights: pd.DataFrame,
             print(f"[Aviso] Não foi possível gerar gráfico: {exc}")
 
 
+def print_attribution(attribution: pd.DataFrame) -> None:
+    print("\nAtribuição por camada")
+    print("─" * 78)
+    print(f"{'Camada':18s} {'Contrib (%)':>12s} {'Média/dia (bp)':>15s} {'Vol (%)':>10s} {'Sharpe':>8s} {'Turnover':>10s}")
+    for name, row in attribution.iterrows():
+        print(f"{name:18s} {row['contrib_pct']:12.2f} {row['ret_medio_diario_bp']:15.2f} {row['vol_anual_pct']:10.2f} {row['sharpe_aprox']:8.2f} {row['turnover']:10.2f}")
+    losers = attribution.drop(index="total_aprox", errors="ignore")
+    if not losers.empty:
+        worst = losers.sort_values("contrib_pct").iloc[0]
+        best = losers.sort_values("contrib_pct", ascending=False).iloc[0]
+        print(f"\nPior camada : {worst.name} ({worst['contrib_pct']:+.2f}%)")
+        print(f"Melhor camada: {best.name} ({best['contrib_pct']:+.2f}%)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest UTIL Hybrid System")
     parser.add_argument("--start", default="2019-01-01")
@@ -427,22 +465,18 @@ def main() -> None:
     parser.add_argument("--top-n", type=int, default=4)
     parser.add_argument("--max-asset", type=float, default=0.19)
     parser.add_argument("--max-exposure", type=float, default=1.00)
-
     parser.add_argument("--core-bull", type=float, default=0.60)
     parser.add_argument("--mr-bull", type=float, default=0.25)
     parser.add_argument("--momentum-bull", type=float, default=0.10)
     parser.add_argument("--pair-bull", type=float, default=0.05)
-
     parser.add_argument("--core-neutral", type=float, default=0.55)
     parser.add_argument("--mr-neutral", type=float, default=0.25)
     parser.add_argument("--momentum-neutral", type=float, default=0.05)
     parser.add_argument("--pair-neutral", type=float, default=0.05)
-
     parser.add_argument("--core-adverse", type=float, default=0.35)
     parser.add_argument("--mr-adverse", type=float, default=0.00)
     parser.add_argument("--momentum-adverse", type=float, default=0.00)
     parser.add_argument("--pair-adverse", type=float, default=0.05)
-
     parser.add_argument("--fee-bps", type=float, default=3.0)
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--csv", action="store_true")
@@ -463,8 +497,9 @@ def main() -> None:
         raise SystemExit("Poucos ativos com dados suficientes. Verifique conexão/datas/yfinance.")
     closes = aligned_field(data, "close")
     volumes = aligned_field(data, "volume").reindex(closes.index).ffill().fillna(0.0)
-    equity, benchmark, weights, turnover = run_backtest(data, closes, volumes, args.capital, args)
+    equity, benchmark, weights, turnover, book_returns, book_turnover = run_backtest(data, closes, volumes, args.capital, args)
     stats = summarize(equity, benchmark, weights, turnover)
+    attribution = layer_attribution(book_returns, weights, book_turnover)
 
     print("\nResumo — UTIL Hybrid System")
     print("─" * 55)
@@ -477,6 +512,7 @@ def main() -> None:
     print(f"Vol anualizada     : {stats.volatility_pct:.2f}%")
     print(f"Exposição média    : {stats.exposure_pct:.1f}%")
     print(f"Turnover bruto     : {stats.turnover:.2f}x")
+    print_attribution(attribution)
 
     last = weights.iloc[-1]
     last = last[last > 0].sort_values(ascending=False)
@@ -490,7 +526,7 @@ def main() -> None:
         print("\n✓ No período testado, a estratégia superou o benchmark UTIL sintético.")
     else:
         print("\n✗ No período testado, a estratégia não superou o benchmark. Ajustar parâmetros e validar fora da amostra.")
-    save_outputs(equity, benchmark, weights, Path("logs"), args.csv, args.plot)
+    save_outputs(equity, benchmark, weights, attribution, Path("logs"), args.csv, args.plot)
 
 
 if __name__ == "__main__":
