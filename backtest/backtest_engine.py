@@ -1,10 +1,13 @@
 """
 Backtest Engine — Tradebot-UTIL.v2
 ──────────────────────────────────
-Helpers compartilhados de dados e benchmark.
+Motor compartilhado de dados, benchmark e backtests.
 
-Benchmark UTIL = índice sintético ponderado pelo mesmo universo UTIL usado nas
-branches main e infra-1, para que o resultado do benchmark seja comparável.
+Correção de benchmark:
+    O UTIL_UNIVERSE abaixo representa a carteira teórica atual usada pelo projeto
+    com 18 ativos, incluindo AXIA3 e AXIA6. Antes o benchmark sintético usava
+    apenas 16 ativos, o que deixava o resultado divergente da composição real
+    documentada em config/universe.yaml.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from typing import Optional
 warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Mock do MetaTrader5 para permitir backtest em Linux sem MT5 instalado.
 mt5_mock = types.ModuleType("MetaTrader5")
 for _attr in [
     "TIMEFRAME_M1", "TIMEFRAME_M5", "TIMEFRAME_M15", "TIMEFRAME_M30",
@@ -48,13 +52,17 @@ import yfinance as yf
 from src.utils.indicators import ema, macd
 
 
+# Composição do Índice UTIL — Vigência Maio-Agosto/2026.
+# Pesos em percentual. Usado como benchmark sintético comum entre main e infra-1.
 UTIL_UNIVERSE = {
     "SBSP3": 19.999,
+    "AXIA3": 17.291,
     "EQTL3": 11.431,
     "ENEV3": 10.708,
     "CPLE3": 10.318,
     "CMIG4": 5.422,
     "ENGI11": 3.786,
+    "AXIA6": 2.708,
     "EGIE3": 2.637,
     "ISAE4": 2.587,
     "CSMG3": 2.440,
@@ -109,6 +117,7 @@ class BacktestResult:
 
     @property
     def total_return_pct(self) -> float:
+        # Mantido por compatibilidade com o runner atual.
         return sum(t.return_pct for t in self.trades)
 
     @property
@@ -183,6 +192,12 @@ def download_data(tickers: list[str], start: str, end: str, verbose: bool = True
 
 
 def synthetic_util_benchmark(data: dict[str, pd.DataFrame], target_index: Optional[pd.Index] = None) -> pd.Series:
+    """Constrói benchmark sintético fiel à carteira atual do UTIL.
+
+    Usa os pesos oficiais em UTIL_UNIVERSE, normalizados apenas entre os ativos
+    disponíveis no backtest. As séries de preço devem estar ajustadas por
+    proventos (auto_adjust=True no yfinance), aproximando um índice de retorno total.
+    """
     available = {t: df for t, df in data.items() if t in UTIL_UNIVERSE and "close" in df.columns}
     if not available:
         return pd.Series(dtype=float)
@@ -195,12 +210,14 @@ def synthetic_util_benchmark(data: dict[str, pd.DataFrame], target_index: Option
     if closes.empty:
         return pd.Series(dtype=float)
 
+    # Normaliza pesos usando somente ativos com dados disponíveis naquela execução.
     weights = pd.Series({ticker: UTIL_UNIVERSE[ticker] for ticker in closes.columns}, dtype=float)
     weights = weights / weights.sum()
     return (closes / closes.iloc[0]).mul(weights, axis=1).sum(axis=1).dropna()
 
 
 def download_benchmark(start: str, end: str) -> pd.Series:
+    """Mantido por compatibilidade. Prefira synthetic_util_benchmark(data)."""
     data = download_data(list(UTIL_UNIVERSE.keys()), start, end, verbose=False)
     return synthetic_util_benchmark(data)
 
@@ -221,6 +238,7 @@ def run_momentum_macro(
     for ticker in assets:
         if ticker not in data:
             continue
+
         ohlcv = data[ticker]
         close = ohlcv["close"]
         e9 = ema(close, ema_fast)
@@ -234,8 +252,10 @@ def run_momentum_macro(
             dt = ohlcv.index[i]
             if pd.isna(e9.iloc[i]) or pd.isna(e21.iloc[i]) or pd.isna(e50.iloc[i]):
                 continue
+
             cross_up = e9.iloc[i] > e21.iloc[i] and e9.iloc[i - 1] <= e21.iloc[i - 1] and e21.iloc[i] > e50.iloc[i]
             macd_bull = macd_line.iloc[i] > sig_line.iloc[i]
+
             if position is None and cross_up and macd_bull:
                 shares = int(alloc / c)
                 if shares > 0:
@@ -248,11 +268,25 @@ def run_momentum_macro(
                     exit_price, exit_reason = c, "trailing_stop"
                 elif c < position["entry_price"] * (1 - stop_pct):
                     exit_price, exit_reason = c, "stop_loss"
+
                 if exit_price is not None:
                     ep = position["entry_price"]
                     sh = position["shares"]
                     ret = (exit_price - ep) / ep
-                    trades.append(Trade(ticker, "momentum_macro", "long", position["entry_date"], dt, ep, exit_price, sh, ep * sh, ret * ep * sh, ret * 100, exit_reason))
+                    trades.append(Trade(
+                        ticker=ticker,
+                        strategy="momentum_macro",
+                        direction="long",
+                        entry_date=position["entry_date"],
+                        exit_date=dt,
+                        entry_price=ep,
+                        exit_price=exit_price,
+                        shares=sh,
+                        capital_used=ep * sh,
+                        pnl=ret * ep * sh,
+                        return_pct=ret * 100,
+                        exit_reason=exit_reason,
+                    ))
                     position = None
 
         if position:
@@ -260,12 +294,32 @@ def run_momentum_macro(
             ep = position["entry_price"]
             sh = position["shares"]
             ret = (c - ep) / ep
-            trades.append(Trade(ticker, "momentum_macro", "long", position["entry_date"], ohlcv.index[-1], ep, c, sh, ep * sh, ret * ep * sh, ret * 100, "end_of_period"))
+            trades.append(Trade(
+                ticker=ticker,
+                strategy="momentum_macro",
+                direction="long",
+                entry_date=position["entry_date"],
+                exit_date=ohlcv.index[-1],
+                entry_price=ep,
+                exit_price=c,
+                shares=sh,
+                capital_used=ep * sh,
+                pnl=ret * ep * sh,
+                return_pct=ret * 100,
+                exit_reason="end_of_period",
+            ))
+
     return trades
 
 
 class BacktestEngine:
-    def __init__(self, start: str = "2019-01-01", end: str = "2026-01-01", capital: float = 100_000.0, tickers: Optional[list[str]] = None):
+    def __init__(
+        self,
+        start: str = "2019-01-01",
+        end: str = "2026-01-01",
+        capital: float = 100_000.0,
+        tickers: Optional[list[str]] = None,
+    ):
         self.start = start
         self.end = end
         self.capital = capital
@@ -278,9 +332,12 @@ class BacktestEngine:
         self.benchmark = synthetic_util_benchmark(self.data)
 
     def run(self, strategies: Optional[list[str]] = None) -> dict[str, BacktestResult]:
-        available = {"momentum_macro": lambda: run_momentum_macro(self.data, self.capital)}
+        available = {
+            "momentum_macro": lambda: run_momentum_macro(self.data, self.capital),
+        }
         to_run = strategies or list(available.keys())
         results: dict[str, BacktestResult] = {}
+
         for name in to_run:
             if name not in available:
                 print(f"  Estratégia '{name}' não encontrada.")
@@ -288,15 +345,21 @@ class BacktestEngine:
             print(f"\n  Executando: {name}...")
             trades = available[name]()
             result = BacktestResult(strategy=name, trades=trades)
+
             all_exits = [(t.exit_date, t.pnl) for t in trades if t.exit_date is not None]
             if all_exits:
                 ordered = sorted(all_exits)
-                equity = pd.Series([self.capital] + [pnl for _, pnl in ordered], index=pd.Index([pd.Timestamp(self.start)] + [dt for dt, _ in ordered])).cumsum()
+                equity = pd.Series(
+                    [self.capital] + [pnl for _, pnl in ordered],
+                    index=pd.Index([pd.Timestamp(self.start)] + [dt for dt, _ in ordered]),
+                ).cumsum()
                 equity.iloc[0] = self.capital
                 result.equity_curve = equity
+
             result.benchmark_curve = self.benchmark
             results[name] = result
             print(f"    → {len(trades)} operações | Win rate: {result.win_rate:.1f}% | Retorno: {result.total_return_pct:+.2f}%")
+
         return results
 
     def summary_table(self, results: dict[str, BacktestResult]) -> pd.DataFrame:
