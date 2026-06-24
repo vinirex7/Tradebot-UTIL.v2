@@ -50,8 +50,6 @@ from src.strategies.active_momentum_tilt import (
 from src.utils.logger import setup_logger
 
 
-# ─── Carregamento de configuração ────────────────────────────────────────────
-
 def load_config(path: str) -> dict:
     p = Path(path)
     if not p.exists():
@@ -64,8 +62,6 @@ def load_config(path: str) -> dict:
     logger.info("Configuração carregada: {}", path)
     return cfg
 
-
-# ─── Notificações (Telegram) ──────────────────────────────────────────────────
 
 def send_telegram(token: str, chat_id: str, message: str) -> bool:
     try:
@@ -87,8 +83,6 @@ def notify(config: dict, message: str) -> None:
     if token and chat_id:
         send_telegram(token, chat_id, message)
 
-
-# ─── Orquestrador principal ───────────────────────────────────────────────────
 
 class TradebotUTILv4:
     """
@@ -123,6 +117,14 @@ class TradebotUTILv4:
             max_drawdown=config["trading"].get("max_drawdown_pct", 0.25),
         )
         self.executor = OrderExecutor(config)
+
+        if self.mode == "live" and not self.executor.is_ready():
+            msg = (
+                "MT5 não está conectado/pronto para LIVE. "
+                "Abra o MetaTrader 5, faça login na XP e rode novamente."
+            )
+            logger.critical(msg)
+            raise RuntimeError(msg)
 
         # Estado do portfólio (persistido entre ciclos)
         self.portfolio = PortfolioState(
@@ -165,8 +167,6 @@ class TradebotUTILv4:
         except Exception as exc:
             logger.warning("Falha ao sincronizar posições MT5: {}", exc)
 
-    # ─── Ciclo principal ────────────────────────────────────────────────────
-
     def run_cycle(self, force_rebalance: bool = False, dry_run: bool = False) -> bool:
         """
         Executa um ciclo completo de verificação/rebalanceamento.
@@ -176,6 +176,10 @@ class TradebotUTILv4:
         """
         today = date.today()
         logger.info("─ Ciclo {} ─────────────────────────────────────────────", today)
+
+        if self.mode == "live" and not self.executor.is_ready():
+            logger.critical("Ciclo LIVE abortado: MT5 não conectado/pronto.")
+            return False
 
         # 1. Atualiza equity (live)
         if self.mode == "live":
@@ -258,6 +262,10 @@ class TradebotUTILv4:
             logger.error("Erro ao executar ordens: {}", exc)
             return False
 
+        if not result.success:
+            logger.error("Rebalanceamento não executado: {}", result.error)
+            return False
+
         # 9. Atualiza estado do portfólio
         self.portfolio.positions = dict(signal.target_weights)
         self.portfolio.last_rebalance = today
@@ -281,8 +289,6 @@ class TradebotUTILv4:
             notify(self.cfg, msg)
 
         return True
-
-    # ─── Loop agendado ──────────────────────────────────────────────────────
 
     def run_loop(self, force_rebalance: bool = False) -> None:
         """
@@ -331,8 +337,6 @@ class TradebotUTILv4:
     def shutdown(self) -> None:
         self.executor.shutdown()
 
-
-# ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
