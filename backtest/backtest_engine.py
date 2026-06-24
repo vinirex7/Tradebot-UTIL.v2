@@ -1,11 +1,13 @@
 """
 Backtest Engine — Tradebot-UTIL.v2
 ──────────────────────────────────
-Motor de backtest da branch main.
+Motor compartilhado de dados, benchmark e backtests.
 
-Branch main = Momentum Macro.
-Benchmark UTIL = índice sintético ponderado pelo mesmo universo UTIL usado na
-infra-1, para que o resultado do benchmark seja comparável entre branches.
+Correção de benchmark:
+    O UTIL_UNIVERSE abaixo representa a carteira teórica atual usada pelo projeto
+    com 18 ativos, incluindo AXIA3 e AXIA6. Antes o benchmark sintético usava
+    apenas 16 ativos, o que deixava o resultado divergente da composição real
+    documentada em config/universe.yaml.
 """
 from __future__ import annotations
 
@@ -50,13 +52,17 @@ import yfinance as yf
 from src.utils.indicators import ema, macd
 
 
+# Composição do Índice UTIL — Vigência Maio-Agosto/2026.
+# Pesos em percentual. Usado como benchmark sintético comum entre main e infra-1.
 UTIL_UNIVERSE = {
     "SBSP3": 19.999,
+    "AXIA3": 17.291,
     "EQTL3": 11.431,
     "ENEV3": 10.708,
     "CPLE3": 10.318,
     "CMIG4": 5.422,
     "ENGI11": 3.786,
+    "AXIA6": 2.708,
     "EGIE3": 2.637,
     "ISAE4": 2.587,
     "CSMG3": 2.440,
@@ -111,6 +117,7 @@ class BacktestResult:
 
     @property
     def total_return_pct(self) -> float:
+        # Mantido por compatibilidade com o runner atual.
         return sum(t.return_pct for t in self.trades)
 
     @property
@@ -185,6 +192,12 @@ def download_data(tickers: list[str], start: str, end: str, verbose: bool = True
 
 
 def synthetic_util_benchmark(data: dict[str, pd.DataFrame], target_index: Optional[pd.Index] = None) -> pd.Series:
+    """Constrói benchmark sintético fiel à carteira atual do UTIL.
+
+    Usa os pesos oficiais em UTIL_UNIVERSE, normalizados apenas entre os ativos
+    disponíveis no backtest. As séries de preço devem estar ajustadas por
+    proventos (auto_adjust=True no yfinance), aproximando um índice de retorno total.
+    """
     available = {t: df for t, df in data.items() if t in UTIL_UNIVERSE and "close" in df.columns}
     if not available:
         return pd.Series(dtype=float)
@@ -197,6 +210,7 @@ def synthetic_util_benchmark(data: dict[str, pd.DataFrame], target_index: Option
     if closes.empty:
         return pd.Series(dtype=float)
 
+    # Normaliza pesos usando somente ativos com dados disponíveis naquela execução.
     weights = pd.Series({ticker: UTIL_UNIVERSE[ticker] for ticker in closes.columns}, dtype=float)
     weights = weights / weights.sum()
     return (closes / closes.iloc[0]).mul(weights, axis=1).sum(axis=1).dropna()
