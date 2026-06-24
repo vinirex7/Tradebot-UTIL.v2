@@ -146,16 +146,7 @@ class OrderExecutor:
                 )
                 return
 
-            kwargs = {
-                "login": login,
-                "password": password,
-                "server": server,
-                "timeout": timeout,
-            }
-            if path:
-                kwargs["path"] = path
-
-            ok = mt5.initialize(**kwargs)
+            ok = self._try_initialize_mt5(mt5, path=path, timeout=timeout, login=login, password=password, server=server)
             if ok:
                 self._set_mt5_ready(mt5, server_label=server)
             else:
@@ -163,43 +154,62 @@ class OrderExecutor:
         except Exception as exc:
             logger.error("Erro ao inicializar MT5: {}", exc)
 
+    def _try_initialize_mt5(
+        self,
+        mt5_module,
+        *,
+        path: str = "",
+        timeout: int = 60000,
+        login: int | None = None,
+        password: str | None = None,
+        server: str | None = None,
+    ) -> bool:
+        """Inicializa MT5 usando o mesmo padrão que funciona no PowerShell."""
+        attempts = []
+        if path and login and password and server:
+            attempts.append(("path+credenciais", lambda: mt5_module.initialize(path=path, login=login, password=password, server=server, timeout=timeout)))
+        if path:
+            attempts.append(("path", lambda: mt5_module.initialize(path=path, timeout=timeout)))
+            attempts.append(("path_posicional", lambda: mt5_module.initialize(path)))
+        if login and password and server:
+            attempts.append(("credenciais", lambda: mt5_module.initialize(login=login, password=password, server=server, timeout=timeout)))
+        attempts.append(("sem_path", lambda: mt5_module.initialize(timeout=timeout)))
+
+        for label, func in attempts:
+            try:
+                mt5_module.shutdown()
+            except Exception:
+                pass
+            ok = func()
+            if ok and mt5_module.account_info() is not None:
+                logger.info("MT5 initialize OK via {}", label)
+                return True
+            logger.debug("MT5 initialize via {} falhou: {}", label, mt5_module.last_error())
+        return False
+
     def _initialize_existing_mt5_session(self, mt5_module, path: str, timeout: int) -> bool:
         """Usa a sessão já aberta/logada do MT5, sem enviar credenciais."""
-        kwargs = {"timeout": timeout}
-        if path:
-            kwargs["path"] = path
-
-        ok = mt5_module.initialize(**kwargs)
-        if not ok:
-            # Em algumas instalações o pacote retorna False com last_error=(0, 'OK'),
-            # apesar de já existir terminal/sessão acessível. Validamos diretamente.
+        ok = self._try_initialize_mt5(mt5_module, path=path, timeout=timeout)
+        if ok:
             info = mt5_module.account_info()
-            if info is not None:
-                self._set_mt5_ready(mt5_module, server_label=getattr(info, "server", "sessão existente"))
-                return True
-
-            term = mt5_module.terminal_info()
-            if term is not None:
-                logger.error(
-                    "MT5 localizado, mas nenhuma conta está logada. "
-                    "Abra o MT5, confirme o login na XP e tente novamente."
-                )
-                return False
-
-            logger.warning("MT5 initialize() sem credenciais falhou: {}", mt5_module.last_error())
-            return False
+            self._set_mt5_ready(mt5_module, server_label=getattr(info, "server", "sessão existente"))
+            return True
 
         info = mt5_module.account_info()
-        if info is None:
+        if info is not None:
+            self._set_mt5_ready(mt5_module, server_label=getattr(info, "server", "sessão existente"))
+            return True
+
+        term = mt5_module.terminal_info()
+        if term is not None:
             logger.error(
-                "MT5 inicializado, mas nenhuma conta está logada. "
-                "Abra o MT5, faça login na XP e rode o bot novamente."
+                "MT5 localizado, mas nenhuma conta está logada. "
+                "Abra o MT5, confirme o login na XP e tente novamente."
             )
-            mt5_module.shutdown()
             return False
 
-        self._set_mt5_ready(mt5_module, server_label=getattr(info, "server", "sessão existente"))
-        return True
+        logger.warning("MT5 initialize() sem credenciais falhou: {}", mt5_module.last_error())
+        return False
 
     def _set_mt5_ready(self, mt5_module, server_label: str) -> None:
         info = mt5_module.account_info()
