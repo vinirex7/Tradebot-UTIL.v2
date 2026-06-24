@@ -110,17 +110,7 @@ class OrderExecutor:
         return bool(_MT5_AVAILABLE and self._mt5_ready)
 
     def _init_mt5(self, mt5_cfg: dict) -> None:
-        """
-        Inicializa o MT5 sem alterar a lógica do bot.
-
-        Fluxo preferencial:
-          1. Se mt5.use_existing_session=true, chama mt5.initialize() sem login/senha
-             para reaproveitar o MT5 já aberto e logado no computador.
-          2. Se mt5.path estiver definido, usa esse executável quando o terminal não
-             estiver aberto ou quando houver múltiplas instalações.
-          3. Só usa login/password/server quando use_existing_session=false ou como
-             fallback explícito se houver credenciais preenchidas.
-        """
+        """Inicializa o MT5 usando sessão existente ou credenciais, sem alterar a estratégia."""
         if not _MT5_AVAILABLE:
             logger.error("MetaTrader5 não instalado — modo live impossível")
             return
@@ -131,26 +121,33 @@ class OrderExecutor:
             timeout = int(mt5_cfg.get("timeout", 60000))
             path = str(mt5_cfg.get("path", "") or "").strip()
             use_existing = bool(mt5_cfg.get("use_existing_session", True))
-
-            if use_existing and self._initialize_existing_mt5_session(mt5, path, timeout):
-                return
-
             login = int(mt5_cfg.get("login", 0) or 0)
             password = str(mt5_cfg.get("password", "") or "")
             server = str(mt5_cfg.get("server", "") or "")
 
-            if not (login and password and server):
-                logger.error(
-                    "MT5 não conectado. Abra o MetaTrader 5 e faça login, "
-                    "ou preencha mt5.path/login/password/server no config."
-                )
-                return
+            if use_existing:
+                if self._initialize_existing_mt5_session(mt5, path, timeout):
+                    return
+                if not (login and password and server):
+                    logger.error(
+                        "MT5 não conectado. Abra o MetaTrader 5 e faça login, "
+                        "ou preencha mt5.path/login/password/server no config."
+                    )
+                    return
 
-            ok = self._try_initialize_mt5(mt5, path=path, timeout=timeout, login=login, password=password, server=server)
+            ok = self._try_initialize_mt5(
+                mt5,
+                path=path,
+                timeout=timeout,
+                login=login if login else None,
+                password=password or None,
+                server=server or None,
+            )
             if ok:
-                self._set_mt5_ready(mt5, server_label=server)
+                info = mt5.account_info()
+                self._set_mt5_ready(mt5, server_label=getattr(info, "server", server or "MT5"))
             else:
-                logger.error("Falha ao conectar MT5 com credenciais: {}", mt5.last_error())
+                logger.error("Falha ao conectar MT5: {}", mt5.last_error())
         except Exception as exc:
             logger.error("Erro ao inicializar MT5: {}", exc)
 
@@ -164,27 +161,87 @@ class OrderExecutor:
         password: str | None = None,
         server: str | None = None,
     ) -> bool:
-        """Inicializa MT5 usando o mesmo padrão que funciona no PowerShell."""
-        attempts = []
-        if path and login and password and server:
-            attempts.append(("path+credenciais", lambda: mt5_module.initialize(path=path, login=login, password=password, server=server, timeout=timeout)))
-        if path:
-            attempts.append(("path", lambda: mt5_module.initialize(path=path, timeout=timeout)))
-            attempts.append(("path_posicional", lambda: mt5_module.initialize(path)))
-        if login and password and server:
-            attempts.append(("credenciais", lambda: mt5_module.initialize(login=login, password=password, server=server, timeout=timeout)))
-        attempts.append(("sem_path", lambda: mt5_module.initialize(timeout=timeout)))
+        """
+        Inicializa MT5 com chamadas diretas.
 
-        for label, func in attempts:
+        Não usa lambdas nem argumentos posicionais. O primeiro caminho testado é
+        exatamente o padrão que funcionou no PowerShell: mt5.initialize(path=p).
+        """
+        def reset_mt5() -> None:
             try:
                 mt5_module.shutdown()
             except Exception:
                 pass
-            ok = func()
+
+        if path:
+            reset_mt5()
+            try:
+                ok = mt5_module.initialize(path=path)
+            except Exception as exc:
+                logger.debug("MT5 initialize(path) gerou exceção: {}", exc)
+                ok = False
             if ok and mt5_module.account_info() is not None:
-                logger.info("MT5 initialize OK via {}", label)
+                logger.info("MT5 initialize OK via path")
                 return True
-            logger.debug("MT5 initialize via {} falhou: {}", label, mt5_module.last_error())
+            logger.debug("MT5 initialize(path) falhou: {}", mt5_module.last_error())
+
+            reset_mt5()
+            try:
+                ok = mt5_module.initialize(path=path, timeout=timeout)
+            except Exception as exc:
+                logger.debug("MT5 initialize(path, timeout) gerou exceção: {}", exc)
+                ok = False
+            if ok and mt5_module.account_info() is not None:
+                logger.info("MT5 initialize OK via path+timeout")
+                return True
+            logger.debug("MT5 initialize(path, timeout) falhou: {}", mt5_module.last_error())
+
+        if path and login and password and server:
+            reset_mt5()
+            try:
+                ok = mt5_module.initialize(
+                    path=path,
+                    login=login,
+                    password=password,
+                    server=server,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                logger.debug("MT5 initialize(path+credenciais) gerou exceção: {}", exc)
+                ok = False
+            if ok and mt5_module.account_info() is not None:
+                logger.info("MT5 initialize OK via path+credenciais")
+                return True
+            logger.debug("MT5 initialize(path+credenciais) falhou: {}", mt5_module.last_error())
+
+        if login and password and server:
+            reset_mt5()
+            try:
+                ok = mt5_module.initialize(
+                    login=login,
+                    password=password,
+                    server=server,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                logger.debug("MT5 initialize(credenciais) gerou exceção: {}", exc)
+                ok = False
+            if ok and mt5_module.account_info() is not None:
+                logger.info("MT5 initialize OK via credenciais")
+                return True
+            logger.debug("MT5 initialize(credenciais) falhou: {}", mt5_module.last_error())
+
+        reset_mt5()
+        try:
+            ok = mt5_module.initialize(timeout=timeout)
+        except Exception as exc:
+            logger.debug("MT5 initialize(timeout) gerou exceção: {}", exc)
+            ok = False
+        if ok and mt5_module.account_info() is not None:
+            logger.info("MT5 initialize OK via timeout")
+            return True
+        logger.debug("MT5 initialize(timeout) falhou: {}", mt5_module.last_error())
+
         return False
 
     def _initialize_existing_mt5_session(self, mt5_module, path: str, timeout: int) -> bool:
