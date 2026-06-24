@@ -7,8 +7,18 @@
 
 # ── MetaTrader 5 ────────────────────────────────────────────
 mt5:
-  login: 0                      # <<< Seu login MT5
-  password: ""                  # <<< Sua senha MT5
+  # true = usa a sessão já aberta/logada no MT5 do computador.
+  # Nesse modo, login/password/server podem ficar vazios se o MT5 já estiver aberto e logado.
+  use_existing_session: true
+
+  # Caminho opcional para o executável do MT5. Use quando o terminal não estiver aberto
+  # ou quando houver mais de uma instalação do MetaTrader no computador.
+  # Windows exemplo: "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+  # Wine/Linux exemplo: "/home/usuario/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+  path: ""
+
+  login: 0                      # <<< Seu login MT5, opcional quando use_existing_session=true
+  password: ""                  # <<< Sua senha MT5, opcional quando use_existing_session=true
   server: "XP Investimentos-Real"   # ou "XP Investimentos-Demo"
   timeout: 60000
 
