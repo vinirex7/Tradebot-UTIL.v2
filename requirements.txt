@@ -1,17 +1,22 @@
-MetaTrader5>=5.0.5488
+# Tradebot-UTIL.v2 — Dependências principais
+# Instalar com: pip install -r requirements.txt
+
+# ── Dados e análise ─────────────────────────────────────────
+yfinance>=0.2.40
 pandas>=2.2.0
 numpy>=1.26.0
-scipy>=1.13.0
-ta>=0.11.0
-requests>=2.32.0
-PyYAML>=6.0.1
-python-dotenv>=1.0.1
+requests>=2.31.0
+python-bcb>=0.3.0         # BCB API para dados macroeconômicos
+
+# ── Agendamento ─────────────────────────────────────────────
 schedule>=1.2.1
+
+# ── Logging ─────────────────────────────────────────────────
 loguru>=0.7.2
-pytz>=2024.1
-python-bcb>=0.4.0
-beautifulsoup4>=4.12.0
-lxml>=5.2.0
-matplotlib>=3.9.0
-seaborn>=0.13.0
-pytest>=8.2.0
+
+# ── Configuração ────────────────────────────────────────────
+pyyaml>=6.0.1
+
+# ── MetaTrader5 (apenas Windows/VPS com MT5 instalado) ──────
+# Descomente para uso em VPS Windows com MT5:
+# MetaTrader5>=5.0.45

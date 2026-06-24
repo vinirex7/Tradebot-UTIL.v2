@@ -1,38 +1,50 @@
 """
-Logger centralizado usando loguru.
+Logger — Tradebot-UTIL.v2
+══════════════════════════
+
+Configuração do loguru para uso em produção.
 """
+from __future__ import annotations
+
 import sys
-from loguru import logger
 from pathlib import Path
 
+from loguru import logger
 
-def setup_logger(log_file: str = "logs/tradebot.log", level: str = "INFO") -> None:
-    """Configura o logger global."""
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
 
+def setup_logger(
+    log_file: str = "logs/tradebot.log",
+    level: str = "INFO",
+    rotation: str = "1 day",
+    retention: str = "90 days",
+    console: bool = True,
+) -> None:
+    """
+    Configura o loguru com:
+      - Saída no console (colorida)
+      - Arquivo rotativo com retenção configurável
+    """
     logger.remove()
 
-    # Console
-    logger.add(
-        sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-               "<level>{level: <8}</level> | "
-               "<cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level=level,
-        colorize=True,
+    fmt_console = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>"
+    )
+    fmt_file = (
+        "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
+        "{name}:{line} — {message}"
     )
 
-    # Arquivo com rotação
+    if console:
+        logger.add(sys.stderr, format=fmt_console, level=level, colorize=True)
+
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
     logger.add(
         log_file,
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} - {message}",
+        format=fmt_file,
         level=level,
-        rotation="1 day",
-        retention="30 days",
-        compression="zip",
+        rotation=rotation,
+        retention=retention,
+        encoding="utf-8",
     )
-
-    logger.info("Logger iniciado. Arquivo: {}", log_file)
-
-
-__all__ = ["logger", "setup_logger"]

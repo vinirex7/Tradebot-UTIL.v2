@@ -32,3 +32,4 @@ Thumbs.db
 *.pkl
 *.parquet
 data/cache/
+tradebot.pid

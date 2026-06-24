@@ -1,0 +1,106 @@
+# ============================================================
+# Tradebot-UTIL.v2 — Active Momentum Tilt v4
+# Config para uso em LIVE / PAPER no MT5 (XP Investimentos)
+#
+# Copie para config.yaml e preencha os campos marcados com <<<
+# ============================================================
+
+# ── MetaTrader 5 ────────────────────────────────────────────
+mt5:
+  login: 0                      # <<< Seu login MT5
+  password: ""                  # <<< Sua senha MT5
+  server: "XP Investimentos-Real"   # ou "XP Investimentos-Demo"
+  timeout: 60000
+
+# ── Modo de operação ────────────────────────────────────────
+trading:
+  mode: "paper"                 # "paper" (simulação) | "live" (real)
+  capital: 100000.0             # <<< Capital total alocado (R$)
+  currency: "BRL"
+
+  # Proteção de risco global
+  max_position_pct: 0.40        # Cap máximo por ativo (igual ao da estratégia)
+  max_drawdown_pct: 0.20        # Drawdown máximo do portfólio antes de pausar
+  stop_loss_pct: 0.00           # Stop por posição individual (0 = desabilitado — usa a estratégia)
+  kelly_fraction: 0.0           # Kelly (0 = desabilitado)
+
+  # Janela de execução de ordens (horário de Brasília)
+  order_window_start: "10:00"   # Abre ordens a partir deste horário
+  order_window_end:   "16:30"   # Fecha ordens até este horário
+  execution_time:     "10:05"   # Horário alvo para envio das ordens de rebalanceamento
+
+# ── Estratégia Active Momentum Tilt v4 ─────────────────────
+strategies:
+  active_momentum_tilt:
+    enabled: true
+
+    # Parâmetros do score de momentum (configuração vencedora dos backtests)
+    top_n: 3                    # Ativos sobrepondados
+    bottom_k: 2                 # Ativos zerados (piores performers relativos)
+    momentum_window: 126        # Horizonte primário em dias (~6 meses)
+    momentum_window2: 252       # Horizonte secundário em dias (~12 meses)
+    momentum_blend: 0.30        # Peso do horizonte de 12m no score (0.30 = 30%)
+    max_asset_weight: 0.40      # Cap máximo por ativo
+
+    # Frequência de rebalanceamento
+    rebalance_day: "last_friday"  # "last_friday" | "last_business"
+
+    # Proteção de drawdown de portfólio
+    dd_stop: 0.20               # Se DD (90d) < -20%, ativa modo crise
+    exposure_crisis: 0.70       # Exposição total no modo crise
+
+    # Universo de ativos (deve corresponder a UTIL_UNIVERSE no backtest_engine.py)
+    universe:
+      - SBSP3
+      - AXIA3
+      - EQTL3
+      - ENEV3
+      - CPLE3
+      - CMIG4
+      - ENGI11
+      - AXIA6
+      - EGIE3
+      - ISAE4
+      - CSMG3
+      - TAEE11
+      - SAPR11
+      - CPFE3
+      - NEOE3
+      - ALUP11
+      - ORVR3
+      - AURE3
+
+# ── Feed de dados ────────────────────────────────────────────
+data:
+  price_history_days: 300       # Dias de histórico para cálculo dos indicadores
+  adjusted_prices: true         # Usar preços ajustados por dividendos (auto_adjust)
+  benchmark_history_days: 300
+  yfinance_suffix: ".SA"        # Sufixo dos tickers no Yahoo Finance
+  selic_update_interval: 3600   # Intervalo de atualização da Selic (segundos)
+
+# ── Custos de transação ──────────────────────────────────────
+execution:
+  fee_bps: 3.0                  # Taxa de corretagem (bps)
+  slippage_bps: 5.0             # Slippage estimado (bps)
+  min_order_value: 100.0        # Valor mínimo de ordem (R$)
+  lot_size: 100                 # Lote padrão B3 (100 ações por lote)
+  partial_fill: true            # Permite preenchimento parcial de ordens
+  order_type: "market"          # "market" | "limit"
+  limit_offset_bps: 5.0         # Offset do limite em relação ao último preço (se limit)
+
+# ── Notificações ─────────────────────────────────────────────
+notifications:
+  enabled: false
+  telegram_token: ""            # <<< Token do bot Telegram (opcional)
+  telegram_chat_id: ""          # <<< Chat ID do Telegram (opcional)
+  notify_on_rebalance: true
+  notify_on_crisis: true
+  notify_on_error: true
+
+# ── Logging ──────────────────────────────────────────────────
+logging:
+  level: "INFO"                 # "DEBUG" | "INFO" | "WARNING" | "ERROR"
+  file: "logs/tradebot_live.log"
+  rotation: "1 day"
+  retention: "90 days"
+  console: true

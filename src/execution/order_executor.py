@@ -1,285 +1,358 @@
 """
-Execução de ordens via MetaTrader 5.
-Suporta modos: live, paper (simulação local) e backtest.
+Order Executor — Tradebot-UTIL.v2
+══════════════════════════════════
+
+Executa ordens de rebalanceamento no MT5 (XP Investimentos).
+
+Responsabilidades:
+  - Converter deltas de peso em ordens de compra/venda
+  - Calcular quantidade de lotes (lote padrão B3 = 100 ações)
+  - Enviar ordens via MT5 com retry e logging
+  - Modo paper: simula execução sem enviar ordens reais
+  - Reportar resultado de cada ordem
+
+Ordem de execução para minimizar risco de exposição:
+  1. VENDAS primeiro (libera capital)
+  2. COMPRAS depois (usa capital liberado)
 """
 from __future__ import annotations
 
-import uuid
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-import MetaTrader5 as mt5
-import pandas as pd
 from loguru import logger
 
-from src.risk.risk_manager import PositionSize, TradeSignal
+try:
+    import MetaTrader5 as mt5
+    _MT5_AVAILABLE = True
+except ImportError:
+    _MT5_AVAILABLE = False
 
+from src.strategies.active_momentum_tilt import RebalanceSignal
+
+
+# ─── Dataclasses ──────────────────────────────────────────────────────────────
 
 @dataclass
 class OrderResult:
-    """Resultado de uma ordem executada."""
-    order_id: str
     ticker: str
-    direction: str
+    direction: str          # "buy" | "sell" | "skip"
     shares: int
-    fill_price: float
-    commission: float
-    timestamp: datetime
-    status: str          # "filled" | "partial" | "rejected" | "simulated"
-    strategy: str
-    notes: str = ""
+    requested_weight_delta: float
+    executed_price: float
+    value: float
+    status: str             # "filled" | "partial" | "failed" | "skipped" | "paper"
+    error: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)
 
+
+@dataclass
+class RebalanceResult:
+    date: datetime
+    mode: str               # "live" | "paper"
+    orders: list[OrderResult] = field(default_factory=list)
+    total_buys: float = 0.0
+    total_sells: float = 0.0
+    total_cost: float = 0.0
+    success: bool = True
+    error: str = ""
+
+    @property
+    def net_value(self) -> float:
+        return self.total_buys - self.total_sells
+
+    def summary(self) -> str:
+        filled = [o for o in self.orders if o.status in ("filled", "paper")]
+        failed = [o for o in self.orders if o.status == "failed"]
+        return (
+            f"Rebalanceamento {'LIVE' if self.mode=='live' else 'PAPER'} | "
+            f"{len(filled)} ordens OK | {len(failed)} falhas | "
+            f"Compras R${self.total_buys:,.0f} | Vendas R${self.total_sells:,.0f} | "
+            f"Custo estimado R${self.total_cost:,.0f}"
+        )
+
+
+# ─── Executor ─────────────────────────────────────────────────────────────────
 
 class OrderExecutor:
     """
-    Executa ordens no MetaTrader 5.
+    Executor de ordens para o Tradebot-UTIL v4.
 
-    Suporta dois modos:
-        live   → envia ordens reais ao MT5 / XP Investimentos
-        paper  → simula ordens sem enviar ao broker (paper trading)
+    Em modo 'paper': simula execução com preços de fechamento + slippage estimado.
+    Em modo 'live':  envia ordens de mercado via MT5.
     """
 
-    DEVIATION_POINTS = 20   # Slippage máximo permitido em pontos
-    MAGIC_NUMBER = 20260621  # Número mágico para identificar ordens do bot
+    LOT_SIZE = 100  # B3 standard lot
 
-    def __init__(self, mode: str = "paper"):
-        self.mode = mode.lower()
-        self._paper_positions: dict[str, dict] = {}
-        self._paper_history: list[OrderResult] = []
-        self._paper_capital = 0.0
+    def __init__(self, config: dict):
+        trading_cfg = config.get("trading", {})
+        exec_cfg = config.get("execution", {})
 
-    def set_paper_capital(self, capital: float) -> None:
-        self._paper_capital = capital
+        self.mode: str         = trading_cfg.get("mode", "paper")
+        self.capital: float    = float(trading_cfg.get("capital", 100_000.0))
+        self.fee_bps: float    = float(exec_cfg.get("fee_bps", 3.0))
+        self.slippage_bps: float = float(exec_cfg.get("slippage_bps", 5.0))
+        self.min_order_value: float = float(exec_cfg.get("min_order_value", 100.0))
+        self.lot_size: int     = int(exec_cfg.get("lot_size", self.LOT_SIZE))
+        self.order_type: str   = exec_cfg.get("order_type", "market")
+        self.limit_offset_bps: float = float(exec_cfg.get("limit_offset_bps", 5.0))
 
-    # ──────────────────────────────────────────────
-    # Interface principal
-    # ──────────────────────────────────────────────
-
-    def send_order(
-        self,
-        signal: TradeSignal,
-        position_size: PositionSize,
-    ) -> Optional[OrderResult]:
-        """
-        Envia uma ordem de compra ou venda.
-        Roteia para live ou paper conforme modo configurado.
-        """
+        self._mt5_ready: bool = False
         if self.mode == "live":
-            return self._send_live_order(signal, position_size)
-        elif self.mode == "paper":
-            return self._send_paper_order(signal, position_size)
-        else:
-            logger.error("Modo de execução inválido: {}", self.mode)
-            return None
-
-    def close_position(self, ticker: str, current_price: float) -> Optional[OrderResult]:
-        """Fecha posição aberta."""
-        if self.mode == "paper":
-            return self._close_paper_position(ticker, current_price)
-        return self._close_live_position(ticker, current_price)
-
-    # ──────────────────────────────────────────────
-    # Live Trading (MT5 real)
-    # ──────────────────────────────────────────────
-
-    def _send_live_order(
-        self,
-        signal: TradeSignal,
-        position_size: PositionSize,
-    ) -> Optional[OrderResult]:
-        """Envia ordem real ao MT5."""
-        info = mt5.symbol_info(signal.ticker)
-        if info is None:
-            logger.error("Símbolo não encontrado: {}", signal.ticker)
-            return None
-
-        if not info.visible:
-            mt5.symbol_select(signal.ticker, True)
-
-        price = mt5.symbol_info_tick(signal.ticker)
-        if price is None:
-            logger.error("Sem tick para {}", signal.ticker)
-            return None
-
-        order_type = mt5.ORDER_TYPE_BUY if signal.direction == "long" else mt5.ORDER_TYPE_SELL
-        fill_price = price.ask if signal.direction == "long" else price.bid
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": signal.ticker,
-            "volume": float(position_size.shares),
-            "type": order_type,
-            "price": fill_price,
-            "sl": signal.stop_loss_price,
-            "tp": signal.take_profit_price,
-            "deviation": self.DEVIATION_POINTS,
-            "magic": self.MAGIC_NUMBER,
-            "comment": f"UTIL.v2|{signal.strategy}",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-
-        result = mt5.order_send(request)
-
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            error = mt5.last_error()
-            logger.error(
-                "Ordem rejeitada: {} | retcode={} | erro={}",
-                signal.ticker, result.retcode if result else "N/A", error
-            )
-            return None
+            self._init_mt5(config.get("mt5", {}))
 
         logger.info(
-            "Ordem LIVE executada: {} {} {} ações @ R$ {:.2f} | ID={}",
-            signal.direction.upper(), signal.ticker,
-            position_size.shares, result.price, result.order
+            "OrderExecutor | modo={} fee={}bps slippage={}bps lote={}",
+            self.mode.upper(), self.fee_bps, self.slippage_bps, self.lot_size
         )
 
-        return OrderResult(
-            order_id=str(result.order),
-            ticker=signal.ticker,
-            direction=signal.direction,
-            shares=position_size.shares,
-            fill_price=result.price,
-            commission=result.comment if isinstance(result.comment, float) else 0.0,
-            timestamp=datetime.now(),
-            status="filled",
-            strategy=signal.strategy,
+    def _init_mt5(self, mt5_cfg: dict) -> None:
+        if not _MT5_AVAILABLE:
+            logger.error("MetaTrader5 não instalado — modo live impossível")
+            return
+        try:
+            import MetaTrader5 as mt5  # noqa
+            ok = mt5.initialize(
+                login=int(mt5_cfg.get("login", 0)),
+                password=str(mt5_cfg.get("password", "")),
+                server=str(mt5_cfg.get("server", "")),
+                timeout=int(mt5_cfg.get("timeout", 60000)),
+            )
+            if ok:
+                info = mt5.account_info()
+                self._mt5_ready = True
+                self.capital = float(info.balance) if info else self.capital
+                logger.info(
+                    "MT5 conectado | servidor={} | saldo=R${:,.2f}",
+                    mt5_cfg.get("server"), self.capital
+                )
+            else:
+                err = mt5.last_error()
+                logger.error("Falha ao conectar MT5: {}", err)
+        except Exception as exc:
+            logger.error("Erro ao inicializar MT5: {}", exc)
+
+    # ─── Execução principal ────────────────────────────────────────────────
+
+    def execute_rebalance(
+        self,
+        signal: RebalanceSignal,
+        current_prices: dict[str, float],
+        current_equity: float,
+    ) -> RebalanceResult:
+        """
+        Executa o rebalanceamento completo a partir de um RebalanceSignal.
+
+        Estratégia de execução:
+          1. Calcula quantidade de ações para cada ativo (em lotes)
+          2. Ordena: vendas primeiro, depois compras
+          3. Envia via MT5 (live) ou simula (paper)
+        """
+        result = RebalanceResult(
+            date=datetime.now(),
+            mode=self.mode,
         )
 
-    def _close_live_position(self, ticker: str, current_price: float) -> Optional[OrderResult]:
-        """Fecha posição live via MT5."""
-        positions = mt5.positions_get(symbol=ticker)
-        if not positions:
-            logger.warning("Nenhuma posição aberta para {}", ticker)
-            return None
+        if not signal.should_rebalance or not signal.deltas:
+            logger.info("Sem ordens para executar")
+            return result
 
-        for pos in positions:
-            if pos.magic != self.MAGIC_NUMBER:
+        # Calcula ordens
+        orders_to_send: list[tuple[str, str, int, float]] = []  # (ticker, side, shares, price)
+        for ticker, delta_w in signal.deltas.items():
+            price = current_prices.get(ticker)
+            if price is None or price <= 0:
+                logger.warning("Sem preço para {} — pulando", ticker)
+                result.orders.append(OrderResult(
+                    ticker=ticker, direction="skip", shares=0,
+                    requested_weight_delta=delta_w, executed_price=0.0,
+                    value=0.0, status="skipped", error="sem_preco",
+                ))
                 continue
 
-            direction = "sell" if pos.type == mt5.ORDER_TYPE_BUY else "buy"
-            price = mt5.symbol_info_tick(ticker)
-            close_price = price.bid if direction == "sell" else price.ask
+            # Valor alvo da variação
+            value_delta = delta_w * current_equity
+            shares_raw = value_delta / price
+            # Arredonda para múltiplos do lote
+            lots = round(shares_raw / self.lot_size)
+            shares = abs(lots) * self.lot_size
+            actual_value = shares * price
 
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": ticker,
-                "volume": pos.volume,
-                "type": mt5.ORDER_TYPE_SELL if direction == "sell" else mt5.ORDER_TYPE_BUY,
-                "price": close_price,
-                "position": pos.ticket,
-                "deviation": self.DEVIATION_POINTS,
-                "magic": self.MAGIC_NUMBER,
-                "comment": "UTIL.v2|close",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            result = mt5.order_send(request)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.info("Posição {} fechada @ R$ {:.2f}", ticker, result.price)
-                return OrderResult(
-                    order_id=str(result.order),
-                    ticker=ticker,
-                    direction="close",
-                    shares=int(pos.volume),
-                    fill_price=result.price,
-                    commission=0.0,
-                    timestamp=datetime.now(),
-                    status="filled",
-                    strategy="close",
-                )
-        return None
+            if actual_value < self.min_order_value or shares == 0:
+                logger.debug("{}: valor R${:.0f} abaixo do mínimo — ignorando", ticker, actual_value)
+                continue
 
-    # ──────────────────────────────────────────────
-    # Paper Trading (simulação)
-    # ──────────────────────────────────────────────
+            side = "buy" if delta_w > 0 else "sell"
+            orders_to_send.append((ticker, side, shares, price))
 
-    def _send_paper_order(
-        self,
-        signal: TradeSignal,
-        position_size: PositionSize,
+        # Ordena: vendas primeiro
+        orders_to_send.sort(key=lambda x: 0 if x[1] == "sell" else 1)
+
+        # Executa
+        for ticker, side, shares, price in orders_to_send:
+            if self.mode == "live":
+                order_result = self._send_mt5_order(ticker, side, shares, price)
+            else:
+                order_result = self._simulate_order(ticker, side, shares, price)
+
+            result.orders.append(order_result)
+            if order_result.status in ("filled", "paper"):
+                cost = order_result.value * (self.fee_bps + self.slippage_bps) / 10_000
+                result.total_cost += cost
+                if side == "buy":
+                    result.total_buys += order_result.value
+                else:
+                    result.total_sells += order_result.value
+
+        logger.info(result.summary())
+        return result
+
+    # ─── Envio MT5 ─────────────────────────────────────────────────────────
+
+    def _send_mt5_order(
+        self, ticker: str, side: str, shares: int, ref_price: float, retries: int = 3
     ) -> OrderResult:
-        """Simula uma ordem sem enviar ao broker."""
-        order_id = str(uuid.uuid4())[:8]
-        commission = position_size.capital_allocated * 0.0005  # 0.05% estimado XP
+        if not _MT5_AVAILABLE or not self._mt5_ready:
+            logger.error("MT5 não disponível para enviar ordem de {}", ticker)
+            return OrderResult(
+                ticker=ticker, direction=side, shares=shares,
+                requested_weight_delta=0.0, executed_price=ref_price,
+                value=0.0, status="failed", error="mt5_indisponivel",
+            )
 
-        self._paper_positions[signal.ticker] = {
-            "direction": signal.direction,
-            "shares": position_size.shares,
-            "entry_price": signal.entry_price,
-            "stop_loss": signal.stop_loss_price,
-            "take_profit": signal.take_profit_price,
-            "strategy": signal.strategy,
-            "order_id": order_id,
-        }
+        import MetaTrader5 as mt5  # noqa
 
-        result = OrderResult(
-            order_id=order_id,
-            ticker=signal.ticker,
-            direction=signal.direction,
-            shares=position_size.shares,
-            fill_price=signal.entry_price,
-            commission=commission,
-            timestamp=datetime.now(),
-            status="simulated",
-            strategy=signal.strategy,
+        action = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
+
+        for attempt in range(retries):
+            try:
+                # Obtém preço atual
+                tick = mt5.symbol_info_tick(ticker)
+                if tick is None:
+                    raise ValueError(f"Sem tick para {ticker}")
+
+                price = tick.ask if side == "buy" else tick.bid
+
+                # Garante que o símbolo está disponível
+                mt5.symbol_select(ticker, True)
+                time.sleep(0.1)
+
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": ticker,
+                    "volume": float(shares / self.lot_size),  # MT5 usa lotes
+                    "type": action,
+                    "price": price,
+                    "deviation": 20,  # slippage máximo em pontos
+                    "magic": 20260624,  # ID do bot
+                    "comment": "tradebot-util-v4",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+
+                result = mt5.order_send(request)
+
+                if result is None:
+                    err = mt5.last_error()
+                    raise ValueError(f"order_send retornou None: {err}")
+
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(
+                        "Ordem executada | {} {} {} ações @ R${:.2f}",
+                        side.upper(), ticker, shares, price
+                    )
+                    return OrderResult(
+                        ticker=ticker, direction=side, shares=shares,
+                        requested_weight_delta=0.0, executed_price=price,
+                        value=shares * price, status="filled",
+                    )
+                else:
+                    raise ValueError(f"retcode={result.retcode} comment={result.comment}")
+
+            except Exception as exc:
+                logger.warning(
+                    "Tentativa {}/{} falhou para {} {}: {}",
+                    attempt + 1, retries, side, ticker, exc
+                )
+                time.sleep(2 ** attempt)  # backoff exponencial
+
+        logger.error("Falha definitiva na ordem {} {}", side, ticker)
+        return OrderResult(
+            ticker=ticker, direction=side, shares=shares,
+            requested_weight_delta=0.0, executed_price=ref_price,
+            value=0.0, status="failed", error="max_retries_excedido",
         )
-        self._paper_history.append(result)
 
-        logger.info(
-            "[PAPER] {} {} {} ações @ R$ {:.2f} | Stop: {:.2f} | TP: {:.2f} | Comissão: {:.2f}",
-            signal.direction.upper(), signal.ticker,
-            position_size.shares, signal.entry_price,
-            signal.stop_loss_price, signal.take_profit_price, commission
-        )
-        return result
+    # ─── Simulação paper ────────────────────────────────────────────────────
 
-    def _close_paper_position(self, ticker: str, current_price: float) -> Optional[OrderResult]:
-        """Fecha posição em modo paper."""
-        if ticker not in self._paper_positions:
-            logger.warning("[PAPER] Nenhuma posição paper para {}", ticker)
-            return None
-
-        pos = self._paper_positions.pop(ticker)
-        entry = pos["entry_price"]
-        shares = pos["shares"]
-
-        if pos["direction"] == "long":
-            pnl = (current_price - entry) * shares
+    def _simulate_order(
+        self, ticker: str, side: str, shares: int, ref_price: float
+    ) -> OrderResult:
+        """Simula execução com slippage de mercado."""
+        slip = self.slippage_bps / 10_000
+        if side == "buy":
+            exec_price = ref_price * (1 + slip)
         else:
-            pnl = (entry - current_price) * shares
+            exec_price = ref_price * (1 - slip)
 
-        commission = current_price * shares * 0.0005
-
-        result = OrderResult(
-            order_id=str(uuid.uuid4())[:8],
-            ticker=ticker,
-            direction="close",
-            shares=shares,
-            fill_price=current_price,
-            commission=commission,
-            timestamp=datetime.now(),
-            status="simulated",
-            strategy=pos["strategy"],
-            notes=f"P&L: R$ {pnl:.2f}",
-        )
-        self._paper_history.append(result)
-
+        value = shares * exec_price
         logger.info(
-            "[PAPER] Posição {} fechada @ R$ {:.2f} | P&L: R$ {:.2f} | Comissão: R$ {:.2f}",
-            ticker, current_price, pnl, commission
+            "[PAPER] {} {} {} ações @ R${:.2f} = R${:,.0f}",
+            side.upper(), ticker, shares, exec_price, value
         )
-        return result
+        return OrderResult(
+            ticker=ticker, direction=side, shares=shares,
+            requested_weight_delta=0.0, executed_price=exec_price,
+            value=value, status="paper",
+        )
 
-    def get_paper_summary(self) -> pd.DataFrame:
-        """Retorna histórico de operações paper."""
-        if not self._paper_history:
-            return pd.DataFrame()
-        records = [vars(r) for r in self._paper_history]
-        return pd.DataFrame(records)
+    # ─── Portfolio atual via MT5 ───────────────────────────────────────────
 
-    def get_open_paper_positions(self) -> dict:
-        """Retorna posições paper abertas."""
-        return dict(self._paper_positions)
+    def get_current_positions(self) -> dict[str, dict]:
+        """
+        Retorna posições abertas no MT5.
+
+        Returns:
+            dict[ticker] → {"shares": int, "avg_price": float, "current_price": float}
+        """
+        if not _MT5_AVAILABLE or not self._mt5_ready:
+            return {}
+        try:
+            import MetaTrader5 as mt5  # noqa
+            positions = mt5.positions_get()
+            if positions is None:
+                return {}
+            result = {}
+            for pos in positions:
+                result[pos.symbol] = {
+                    "shares": int(pos.volume * self.lot_size),
+                    "avg_price": float(pos.price_open),
+                    "current_price": float(pos.price_current),
+                    "profit": float(pos.profit),
+                }
+            return result
+        except Exception as exc:
+            logger.error("Erro ao buscar posições MT5: {}", exc)
+            return {}
+
+    def get_account_equity(self) -> float:
+        """Retorna patrimônio líquido atual da conta MT5."""
+        if not _MT5_AVAILABLE or not self._mt5_ready:
+            return self.capital
+        try:
+            import MetaTrader5 as mt5  # noqa
+            info = mt5.account_info()
+            return float(info.equity) if info else self.capital
+        except Exception:
+            return self.capital
+
+    def shutdown(self) -> None:
+        if _MT5_AVAILABLE and self._mt5_ready:
+            try:
+                import MetaTrader5 as mt5  # noqa
+                mt5.shutdown()
+                logger.info("MT5 desconectado")
+            except Exception:
+                pass
