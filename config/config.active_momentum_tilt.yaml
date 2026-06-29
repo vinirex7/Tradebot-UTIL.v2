@@ -6,20 +6,30 @@
 # ============================================================
 
 # ── MetaTrader 5 ────────────────────────────────────────────
+#
+# MODO RECOMENDADO (XP Investimentos):
+#   1. Abra o MetaTrader 5 manualmente e faça login na XP.
+#   2. Deixe o bot conectar à sessão já aberta (use_credentials: false).
+#   O campo `path` é necessário apenas se o MT5 não estiver aberto
+#   antes de iniciar o bot.
+#
 mt5:
-  # true = usa a sessão já aberta/logada no MT5 do computador.
-  # Nesse modo, login/password/server podem ficar vazios se o MT5 já estiver aberto e logado.
-  use_existing_session: true
+  # Caminho para o executável do MT5 (só necessário se não estiver aberto).
+  # Exemplos:
+  #   Windows: C:\Program Files\XP Investimentos MT5\terminal64.exe
+  #   Deixe vazio para usar a instância já aberta.
+  path: ""                      # <<< Preencha se o MT5 não estiver aberto antes do bot
 
-  # Caminho opcional para o executável do MT5. Use quando o terminal não estiver aberto
-  # ou quando houver mais de uma instalação do MetaTrader no computador.
-  # Windows exemplo: "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
-  # Wine/Linux exemplo: "/home/usuario/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-  path: ""
+  # use_credentials: false = conecta à sessão existente (CORRETO para XP)
+  # use_credentials: true  = tenta autenticar com login/senha (causa
+  #                          Authorization failed se já houver outra sessão)
+  use_credentials: false
 
-  login: 0                      # <<< Seu login MT5, opcional quando use_existing_session=true
-  password: ""                  # <<< Sua senha MT5, opcional quando use_existing_session=true
-  server: "XP Investimentos-Real"   # ou "XP Investimentos-Demo"
+  # Preencha SOMENTE se use_credentials: true
+  login: 0
+  password: ""
+  server: "XP Investimentos-Real"  # ou "XP Investimentos-Demo"
+
   timeout: 60000
 
 # ── Modo de operação ────────────────────────────────────────

@@ -102,6 +102,20 @@ for arg in "$@"; do
     EXTRA_ARGS+=("$arg")
 done
 
+# ── Lembrete: MT5 precisa estar aberto (modo live) ────────────
+if [[ " ${EXTRA_ARGS[*]} " == *"--live"* ]]; then
+    echo -e "${YELLOW}"
+    echo "  ⚠️  ATENÇÃO: Modo LIVE ativado"
+    echo "  Certifique-se de que o MetaTrader 5 está ABERTO e LOGADO na XP"
+    echo "  antes de continuar. O bot conecta à sessão existente (sem re-login)."
+    echo -e "${NC}"
+    read -r -p "  MT5 está aberto e logado? (sim/não): " CONFIRM
+    if [[ "$CONFIRM" != "sim" && "$CONFIRM" != "s" ]]; then
+        echo "Cancelado. Abra o MT5, faça login e tente novamente."
+        exit 0
+    fi
+fi
+
 # ── Inicia o bot ───────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}Iniciando Tradebot-UTIL.v2...${NC}"
